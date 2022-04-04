@@ -213,7 +213,6 @@ def apertium_parser(dedoc_output, apertium_path, lang):
                 if match not in trans_list:
                     trans_list.append(match)
             return trans_list
-
         i = -1
         for morph_element in morph_elements:
             i += 1
@@ -297,7 +296,7 @@ def apertium_parser(dedoc_output, apertium_path, lang):
         s2 = os.system("echo \"" + dedoc_output_without_tags + "\" | apertium -d " + apertium_path + "/apertium-tat-bak bak-tat-morph >> " + morph_filename)
 
     if lang == 'sah':
-        s1 = os.system("echo \"" + dedoc_output_without_tags + "\" | apertium -d " + apertium_path + "/apertium-sah sah-morph >> " + morph_filename)
+        s1 = os.system("echo \"" + dedoc_output_without_tags + "\" | apertium -d " + apertium_path + "/apertium-sah sah-multi >> " + morph_filename)
         s2 = s1
 
     if lang == 'bak':
