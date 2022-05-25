@@ -61,6 +61,7 @@ class Grant(LingvodocObjectType):
     owners = graphene.List(User)
 
     issuer = graphene.String()
+    issuer_translations = ObjectVal()
 
     class Meta:
         interfaces = (CreatedAt,
@@ -69,30 +70,32 @@ class Grant(LingvodocObjectType):
                       AdditionalMetadata,
                       TranslationHolder
                     )
-    pass
+
+    @staticmethod
+    def from_date(date):
+
+        return (
+            datetime.datetime
+                .strptime(date, '%Y-%m-%d')
+                .replace(tzinfo = datetime.timezone.utc)
+                .timestamp())
 
     @fetch_object("issuer")
     def resolve_issuer(self, info):
         context = info.context
         return str(self.dbObject.get_issuer_translation(context.get('locale_id')))
 
+    @fetch_object("issuer_translations")
+    def resolve_issuer_translations(self, info):
+        return self.dbObject.get_issuer_translations()
+
     @fetch_object("begin")
     def resolve_begin(self, info):
-
-        return (
-            datetime.datetime
-                .strptime(self.dbObject.begin, '%Y-%m-%d')
-                .replace(tzinfo = datetime.timezone.utc)
-                .timestamp())
+        return Grant.from_date(self.dbObject.begin)
 
     @fetch_object("end")
     def resolve_end(self, info):
-
-        return (
-            datetime.datetime
-                .strptime(self.dbObject.end, '%Y-%m-%d')
-                .replace(tzinfo = datetime.timezone.utc)
-                .timestamp())
+        return Grant.from_date(self.dbObject.end)
 
     @fetch_object("issuer_translation_gist_id")
     def resolve_issuer_translation_gist_id(self, info):

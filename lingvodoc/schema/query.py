@@ -156,7 +156,10 @@ from lingvodoc.schema.gql_holders import (
     client_id_check,
     LingvodocID,
     Upload,
-    UnstructuredData
+    UnstructuredData,
+    published_translation_gist_id_query,
+    published_translation_gist_id_cte_query,
+    CreatedAt,
     # LevelAndId
 )
 
@@ -201,6 +204,7 @@ from lingvodoc.models import (
     ParserResult as dbParserResult,
     PublishingEntity as dbPublishingEntity,
     RUSSIAN_LOCALE,
+    SLBigInteger,
     TranslationAtom as dbTranslationAtom,
     TranslationGist as dbTranslationGist,
     UnstructuredData as dbUnstructuredData,
@@ -231,7 +235,9 @@ from sqlalchemy import (
     tuple_,
     create_engine,
     literal,
-    union
+    union,
+    cast,
+    Boolean,
 )
 
 import sqlalchemy.dialects.postgresql as postgresql
@@ -244,6 +250,7 @@ from lingvodoc.views.v2.utils import (
 )
 from sqlalchemy.orm import aliased
 
+from sqlalchemy.sql.expression import Grouping
 from sqlalchemy.sql.functions import coalesce
 from lingvodoc.schema.gql_tasks import Task, DeleteTask
 from lingvodoc.schema.gql_convert_dictionary import ConvertDictionary, ConvertFiveTiers
@@ -256,7 +263,7 @@ from lingvodoc.utils.phonology import (
     gql_phonology_link_perspective_data,
     gql_sound_and_markup)
 
-from lingvodoc.utils import starling_converter, render_statement
+from lingvodoc.utils import starling_converter, render_statement, ids_to_id_query
 
 from lingvodoc.utils.search import (
     translation_gist_search,
@@ -437,6 +444,11 @@ class MergeSuggestions(graphene.ObjectType):
     user_has_permissions = graphene.Boolean()
 
 
+class LanguageTree(graphene.ObjectType):
+    tree = ObjectVal()
+    languages = graphene.List(Language)
+
+
 def get_dict_attributes(sqconn):
     dict_trav = sqconn.cursor()
     dict_trav.execute("""SELECT
@@ -468,7 +480,18 @@ class Query(graphene.ObjectType):
     perspective = graphene.Field(DictionaryPerspective, id=LingvodocID())
     entity = graphene.Field(Entity, id=LingvodocID())
     language = graphene.Field(Language, id=LingvodocID())
-    languages = graphene.List(Language, id_list=graphene.List(LingvodocID))
+
+    languages = (
+
+        graphene.List(
+            Language,
+            id_list = graphene.List(LingvodocID),
+            standard_order = graphene.Boolean(),
+            only_in_toc = graphene.Boolean(),
+            only_with_dictionaries_recursive = graphene.Boolean(),
+            dictionary_category = graphene.Int(),
+            dictionary_published = graphene.Boolean()))
+
     user = graphene.Field(User, id=graphene.Int())
     users = graphene.List(User, search=graphene.String())
     field = graphene.Field(Field, id=LingvodocID())
@@ -476,7 +499,16 @@ class Query(graphene.ObjectType):
     userblob = graphene.Field(UserBlobs, id=LingvodocID())
     translationatom = graphene.Field(TranslationAtom, id=LingvodocID())
     organization = graphene.Field(Organization, id=LingvodocID())
-    organizations = graphene.List(Organization)
+
+    organizations = (
+
+        graphene.List(
+            Organization,
+            has_participant = graphene.Boolean(),
+            participant_deleted = graphene.Boolean(),
+            participant_category = graphene.Int(),
+            participant_published = graphene.Boolean()))
+
     lexicalentry = graphene.Field(LexicalEntry, id=LingvodocID())
     basic_search = graphene.Field(LexicalEntriesAndEntities, searchstring=graphene.String(),
                                   can_add_tags=graphene.Boolean(),
@@ -515,7 +547,16 @@ class Query(graphene.ObjectType):
     template_fields = graphene.List(Field, mode=graphene.String())
     template_modes = graphene.List(graphene.String)
     grant = graphene.Field(Grant, id=graphene.Int())
-    grants = graphene.List(Grant)
+
+    grants = (
+
+        graphene.List(
+            Grant,
+            has_participant = graphene.Boolean(),
+            participant_deleted = graphene.Boolean(),
+            participant_category = graphene.Int(),
+            participant_published = graphene.Boolean()))
+
     column = graphene.Field(Column, id=LingvodocID())
 
     phonology_tier_list = graphene.Field(TierList, perspective_id=LingvodocID(required=True))
@@ -559,7 +600,8 @@ class Query(graphene.ObjectType):
 
     eaf_wordlist = graphene.Field(
         graphene.List(graphene.String), id=LingvodocID(required=True))
-    language_tree = graphene.List(Language)
+    language_order = graphene.List(Language)
+
     permission_lists = graphene.Field(Permissions, proxy=graphene.Boolean(required=True))
     tasks = graphene.List(Task)
     is_authenticated = graphene.Boolean()
@@ -620,6 +662,2559 @@ class Query(graphene.ObjectType):
             accept_value = graphene.Boolean(),
             sort_order_list = graphene.List(graphene.String),
             debug_flag = graphene.Boolean()))
+
+    language_toc = graphene.List(Language)
+
+    language_tree = (
+
+        graphene.Field(
+            LanguageTree,
+            language_id = LingvodocID(),
+            by_grants = graphene.Boolean(),
+            grant_id = graphene.Int(),
+            by_organizations = graphene.Boolean(),
+            organization_id = graphene.Int(),
+            debug_flag = graphene.Boolean()))
+
+    def resolve_language_tree(
+        self,
+        info,
+        language_id = None,
+        by_grants = False,
+        grant_id = None,
+        by_organizations = False,
+        organization_id = None,
+        debug_flag = False):
+
+        try:
+
+            grant_or_organization = (
+                by_grants and grant_id is None or
+                by_organizations and organization_id is None)
+
+            grant_or_organization_id = (
+                grant_id is not None or
+                organization_id is not None)
+
+            # Analyzing query.
+
+            languages_flag = False
+
+            object_flag = False
+            translations_flag = False
+            in_toc_flag = False
+
+            dictionaries_flag = False
+            d_object_flag = False
+            d_translations_flag = False
+            d_english_status_flag = False
+            d_category = None
+
+            def f(argument):
+
+                try:
+
+                    return argument.value.value
+
+                except AttributeError:
+
+                    return (
+
+                        info.variable_values.get(
+                            argument.value.name.value, None))
+
+            for field in info.field_asts:
+
+                if field.name.value != 'language_tree':
+
+                    continue
+
+                for subfield in field.selection_set.selections:
+
+                    name_str = subfield.name.value
+
+                    if name_str == 'tree':
+
+                        tree_flag = True
+                        continue
+
+                    elif name_str != 'languages':
+
+                        continue
+
+                    languages_flag = True
+
+                    for language_field in subfield.selection_set.selections:
+
+                        name_str = language_field.name.value
+
+                        if name_str == 'dictionaries':
+
+                            dictionaries_flag = True
+
+                            for argument in language_field.arguments:
+
+                                if argument.name.value == 'category':
+
+                                    d_category = f(argument)
+                                    break
+
+                            for subfield in language_field.selection_set.selections:
+
+                                if subfield.name.value == 'translations':
+                                    d_translations_flag = True
+
+                                elif subfield.alias and subfield.alias.value == 'english_status':
+                                    d_english_status_flag = True
+
+                        elif name_str == 'translations':
+
+                            translations_flag = True
+
+                        elif name_str == 'in_toc':
+
+                            in_toc_flag = True
+
+                        elif (
+                            name_str != 'id' and
+                            name_str != '__typename'):
+
+                            object_flag = True
+
+            # In some cases we store dictionary or language ids in temporary tables.
+
+            dictionary_table_name = None
+            language_table_name = None
+
+            # We always start with a language id CTE, we'll at least either have to join for dictionary counts or
+            # start bottom-up from dictionaries.
+
+            language_id_cte = None
+
+            # If we are going to request dictionaries, we'll need a temporary table with either dictionary ids,
+            # when we get the tree for a single grant or a single organization, or with language ids.
+
+            if dictionaries_flag:
+
+                if grant_or_organization_id:
+
+                    dictionary_table_name = (
+
+                        'dictionary_ids_' +
+                         str(uuid.uuid4()).replace('-', '_'))
+
+                    table_sql_str = f'''
+
+                        create temporary table
+                          {dictionary_table_name}
+                          on commit drop as
+
+                          select P.*
+
+                          from
+                            {'public.grant' if grant_id is not None else 'organization'} S
+
+                          cross join
+                            jsonb_to_recordset(S.additional_metadata -> 'participant')
+                              P (client_id bigint, object_id bigint)
+
+                          where S.id = {grant_id if grant_id is not None else organization_id};
+
+                        '''
+
+                    DBSession.execute(table_sql_str)
+
+                    # Getting languages bottom up through recursive CTE.
+
+                    class tmpDictionary(models.Base):
+
+                        __tablename__ = dictionary_table_name
+
+                        client_id = sqlalchemy.Column(SLBigInteger, primary_key = True)
+                        object_id = sqlalchemy.Column(SLBigInteger, primary_key = True)
+
+                    filter_list = [
+
+                        dbDictionary.client_id == tmpDictionary.client_id,
+                        dbDictionary.object_id == tmpDictionary.object_id,
+                        dbDictionary.marked_for_deletion == False,
+
+                        dbLanguage.client_id == dbDictionary.parent_client_id,
+                        dbLanguage.object_id == dbDictionary.parent_object_id,
+                        dbLanguage.marked_for_deletion == False]
+
+                    if d_category is not None:
+
+                        filter_list.append(
+                            dbDictionary.category == d_category)
+
+                    base_cte = (
+
+                        DBSession
+
+                            .query(
+                                dbLanguage.client_id,
+                                dbLanguage.object_id,
+                                dbLanguage.parent_client_id,
+                                dbLanguage.parent_object_id)
+
+                            .filter(
+                                *filter_list)
+
+                            .group_by(
+                                dbLanguage.client_id,
+                                dbLanguage.object_id)
+
+                            .cte(recursive = True))
+
+                    recursive_query = (
+
+                        DBSession
+
+                            .query(
+                                dbLanguage.client_id,
+                                dbLanguage.object_id,
+                                dbLanguage.parent_client_id,
+                                dbLanguage.parent_object_id)
+
+                            .filter(
+                                dbLanguage.client_id == base_cte.c.parent_client_id,
+                                dbLanguage.object_id == base_cte.c.parent_object_id,
+                                dbLanguage.marked_for_deletion == False)
+
+                            .group_by(
+                                dbLanguage.client_id,
+                                dbLanguage.object_id))
+
+                    language_id_cte = (
+                        base_cte.union(recursive_query))
+
+                # Getting languages top down, all the languages or a single language.
+
+                else:
+
+                    language_table_name = (
+
+                        'language_ids_' +
+                         str(uuid.uuid4()).replace('-', '_'))
+
+                    if language_id is None:
+
+                        table_sql_str = f'''
+
+                            create temporary table
+                              {language_table_name}
+                              on commit drop as
+
+                              select
+                                client_id, object_id
+
+                              from
+                                language
+
+                              where
+                                marked_for_deletion = false;
+
+                            '''
+
+                    else:
+
+                        table_sql_str = f'''
+
+                            create temporary table
+                              {language_table_name}
+                              on commit drop as
+
+                              with recursive
+
+                              ids_cte (client_id, object_id) as (
+
+                                values ({language_id[0]} :: bigint, {language_id[1]} :: bigint)
+
+                                union
+
+                                select
+                                  L.client_id,
+                                  L.object_id
+
+                                from
+                                  language L,
+                                  ids_cte I
+
+                                where
+                                  L.parent_client_id = I.client_id and
+                                  L.parent_object_id = I.object_id and
+                                  L.marked_for_deletion = false
+                              )
+
+                              select *
+
+                              from
+                                ids_cte;
+
+                            '''
+
+                    DBSession.execute(table_sql_str)
+
+                    language_id_cte = (
+
+                        DBSession
+
+                            .query(
+
+                                sqlalchemy
+
+                                    .text(f'select * from {language_table_name}')
+
+                                    .columns(
+                                        client_id = SLBigInteger,
+                                        object_id = SLBigInteger)
+
+                                    .alias())
+
+                            .cte())
+
+            # No need for a temporary table for dictionaries, we can form base language id CTE directly.
+
+            elif grant_or_organization_id:
+
+                dictionary_sql_str = f'''
+
+                    select P.*
+
+                    from
+                      {'public.grant' if grant_id is not None else 'organization'} S
+
+                    cross join
+                      jsonb_to_recordset(S.additional_metadata -> 'participant')
+                        P(client_id bigint, object_id bigint)
+
+                    where S.id = {grant_id if grant_id is not None else organization_id}
+
+                    '''
+
+                dictionary_id_cte = (
+
+                    DBSession
+
+                        .query(
+
+                            sqlalchemy
+
+                                .text(dictionary_sql_str)
+
+                                .columns(
+                                    client_id = SLBigInteger,
+                                    object_id = SLBigInteger)
+
+                                .alias())
+
+                        .cte())
+
+                # Same bottom-up construction.
+
+                filter_list = [
+
+                    dbDictionary.client_id == dictionary_id_cte.c.client_id,
+                    dbDictionary.object_id == dictionary_id_cte.c.object_id,
+                    dbDictionary.marked_for_deletion == False,
+
+                    dbLanguage.client_id == dbDictionary.parent_client_id,
+                    dbLanguage.object_id == dbDictionary.parent_object_id,
+                    dbLanguage.marked_for_deletion == False]
+
+                if d_category is not None:
+
+                    filter_list.append(
+                        dbDictionary.category == d_category)
+
+                base_cte = (
+
+                    DBSession
+
+                        .query(
+                            dbLanguage.client_id,
+                            dbLanguage.object_id,
+                            dbLanguage.parent_client_id,
+                            dbLanguage.parent_object_id)
+
+                        .filter(
+                            *filter_list)
+
+                        .group_by(
+                            dbLanguage.client_id,
+                            dbLanguage.object_id)
+
+                        .cte(recursive = True))
+
+                recursive_query = (
+
+                    DBSession
+
+                        .query(
+                            dbLanguage.client_id,
+                            dbLanguage.object_id,
+                            dbLanguage.parent_client_id,
+                            dbLanguage.parent_object_id)
+
+                        .filter(
+                            dbLanguage.client_id == base_cte.c.parent_client_id,
+                            dbLanguage.object_id == base_cte.c.parent_object_id,
+                            dbLanguage.marked_for_deletion == False)
+
+                        .group_by(
+                            dbLanguage.client_id,
+                            dbLanguage.object_id))
+
+                language_id_cte = (
+
+                    base_cte.union(recursive_query))
+
+            elif language_id is not None:
+
+                base_cte = (
+
+                    ids_to_id_query(
+                        (language_id,),
+                        explicit_cast = True)
+
+                        .cte(recursive = True))
+
+                recursive_query = (
+
+                    DBSession
+
+                        .query(
+                            dbLanguage.client_id,
+                            dbLanguage.object_id)
+
+                        .filter(
+                            dbLanguage.parent_client_id == base_cte.c.client_id,
+                            dbLanguage.parent_object_id == base_cte.c.object_id,
+                            dbLanguage.marked_for_deletion == False))
+
+                language_id_cte = (
+
+                    base_cte.union(recursive_query))
+
+            else:
+
+                language_id_cte = (
+
+                    DBSession
+
+                        .query(
+                            dbLanguage.client_id,
+                            dbLanguage.object_id)
+
+                        .filter(
+                            dbLanguage.marked_for_deletion == False)
+
+                        .cte())
+
+            # Starting construction of the main query, with whole objects or just what we need.
+
+            if object_flag:
+
+                select_list = [
+                    dbLanguage]
+
+            else:
+
+                select_list = [
+                    dbLanguage.client_id,
+                    dbLanguage.object_id,
+                    dbLanguage.parent_client_id,
+                    dbLanguage.parent_object_id,
+                    dbLanguage.additional_metadata]
+
+            query = (
+
+                DBSession
+
+                    .query(
+                        *select_list)
+
+                    .filter(
+                        dbLanguage.client_id == language_id_cte.c.client_id,
+                        dbLanguage.object_id == language_id_cte.c.object_id))
+
+            # If we don't get languages from the dictionaries bottom up, we'll have to filter them
+            # by dictionary counts.
+
+            dictionary_join_list = [
+                dbDictionary.parent_client_id == language_id_cte.c.client_id,
+                dbDictionary.parent_object_id == language_id_cte.c.object_id,
+                dbDictionary.marked_for_deletion == False]
+
+            if d_category is not None:
+
+                dictionary_join_list.append(
+                    dbDictionary.category == d_category)
+
+            if not grant_or_organization_id:
+
+                dictionary_count_cte = (
+
+                    DBSession
+
+                        .query(
+                            language_id_cte.c.client_id,
+                            language_id_cte.c.object_id)
+
+                        .outerjoin(
+                            dbDictionary,
+                            and_(*dictionary_join_list))
+
+                        .add_columns(
+                            func.count()
+                                .filter(dbDictionary.client_id != None)
+                                .label('total_count'))
+
+                        .group_by(
+                            language_id_cte.c.client_id,
+                            language_id_cte.c.object_id)
+
+                        .cte())
+
+                query = (
+
+                    query
+
+                        .join(
+                            dictionary_count_cte,
+
+                            and_(
+                                dbLanguage.client_id == dictionary_count_cte.c.client_id,
+                                dbLanguage.object_id == dictionary_count_cte.c.object_id))
+
+                        .add_columns(
+                            dictionary_count_cte.c.total_count))
+
+            # If we are looking at all grants or at all organizations, we'll also have to get
+            # per grant / per organization and no grant / no organization counts.
+
+            if grant_or_organization:
+
+                participant_table_name = (
+
+                    'participant_ids_' +
+                     str(uuid.uuid4()).replace('-', '_'))
+
+                participant_filter_str = (
+                    '' if by_grants else
+                    'where G.marked_for_deletion = false')
+
+                table_sql_str = f'''
+
+                    create temporary table
+                      {participant_table_name}
+                      on commit drop as
+
+                      select
+                        P.client_id,
+                        P.object_id,
+                        G.id
+
+                      from
+                        {'public.grant' if by_grants else 'organization'} G
+
+                      cross join
+                        jsonb_to_recordset(G.additional_metadata -> 'participant')
+                          P (client_id bigint, object_id bigint)
+
+                      {'' if by_grants else 'where G.marked_for_deletion = false'};
+
+                    '''
+
+                DBSession.execute(table_sql_str)
+
+                class tmpParticipant(models.Base):
+
+                    __tablename__ = participant_table_name
+
+                    client_id = sqlalchemy.Column(SLBigInteger, primary_key = True)
+                    object_id = sqlalchemy.Column(SLBigInteger, primary_key = True)
+
+                    id = sqlalchemy.Column(SLBigInteger, nullable = False)
+
+                joint_cte = (
+
+                    DBSession
+
+                        .query(
+                            language_id_cte.c.client_id,
+                            language_id_cte.c.object_id)
+
+                        .outerjoin(
+                            dbDictionary,
+                            and_(*dictionary_join_list))
+
+                        .add_columns(
+                            dbDictionary.client_id.label('dictionary_client_id'),
+                            dbDictionary.object_id.label('dictionary_object_id'))
+
+                        .outerjoin(
+                            tmpParticipant,
+
+                            and_(
+                                dbDictionary.client_id == tmpParticipant.client_id,
+                                dbDictionary.object_id == tmpParticipant.object_id))
+
+                        .add_columns(
+
+                            sqlalchemy
+
+                                .literal_column(f'''
+                                    (case when dictionary.client_id is null then null else
+                                        coalesce({participant_table_name}.id :: text, '') end)
+                                    ''')
+
+                                .label('group_id'))
+
+                        .cte('joint_cte'))
+
+                base_count_cte = (
+
+                    DBSession
+
+                        .query(
+                            joint_cte.c.client_id,
+                            joint_cte.c.object_id,
+                            joint_cte.c.group_id,
+
+                            func.count()
+                                .filter(joint_cte.c.dictionary_client_id != None)
+                                .label('base_count'))
+
+                        .group_by(
+                            joint_cte.c.client_id,
+                            joint_cte.c.object_id,
+                            joint_cte.c.group_id,)
+
+                        .cte('base_count_cte'))
+
+                aggregate_count_cte = (
+
+                    DBSession
+
+                        .query(
+                            base_count_cte.c.client_id,
+                            base_count_cte.c.object_id,
+
+                            func
+                                .jsonb_object_agg(
+                                    base_count_cte.c.group_id,
+                                    base_count_cte.c.base_count)
+
+                                .filter(
+                                    base_count_cte.c.group_id != None)
+
+                                .label('aggregate_count'))
+
+                        .group_by(
+                            base_count_cte.c.client_id,
+                            base_count_cte.c.object_id)
+
+                        .cte('aggregate_count_cte'))
+
+                query = (
+
+                    query
+
+                        .join(
+                            aggregate_count_cte,
+
+                            and_(
+                                dbLanguage.client_id == aggregate_count_cte.c.client_id,
+                                dbLanguage.object_id == aggregate_count_cte.c.object_id))
+
+                        .add_columns(
+                            aggregate_count_cte.c.aggregate_count))
+
+            # If we'll need translations, we'll also request translations.
+
+            if translations_flag:
+
+                translations_cte = (
+
+                    DBSession
+
+                        .query(
+                            dbLanguage.client_id,
+                            dbLanguage.object_id)
+
+                        .filter(
+                            dbLanguage.client_id == language_id_cte.c.client_id,
+                            dbLanguage.object_id == language_id_cte.c.object_id)
+
+                        .outerjoin(
+                            dbTranslationAtom,
+
+                            and_(
+                                dbTranslationAtom.parent_client_id == dbLanguage.translation_gist_client_id,
+                                dbTranslationAtom.parent_object_id == dbLanguage.translation_gist_object_id,
+                                dbTranslationAtom.marked_for_deletion == False))
+
+                        .add_columns(
+
+                            func
+                                .jsonb_object_agg(
+                                    dbTranslationAtom.locale_id,
+                                    dbTranslationAtom.content)
+
+                                .filter(dbTranslationAtom.locale_id != None)
+
+                                .label('translations'))
+
+                        .group_by(
+                            dbLanguage.client_id,
+                            dbLanguage.object_id)
+
+                        .cte())
+
+                query = (
+
+                    query
+
+                        .join(
+                            translations_cte,
+
+                            and_(
+                                dbLanguage.client_id == translations_cte.c.client_id,
+                                dbLanguage.object_id == translations_cte.c.object_id))
+
+                        .add_columns(
+                            translations_cte.c.translations))
+
+            # Getting language info, generating language tree order.
+
+            result_list = query.all()
+
+            log.debug(
+                '\nquery:\n' +
+                render_statement(query.statement))
+
+            tree_dict = collections.defaultdict(list)
+
+            for result in result_list:
+
+                if object_flag:
+
+                    language = result[0]
+
+                    id = language.id
+                    parent_id = language.parent_id
+                    additional_metadata = language.additional_metadata
+
+                else:
+
+                    (client_id, object_id,
+                        parent_client_id, parent_object_id,
+                        additional_metadata) = result[:5]
+
+                    id = (client_id, object_id)
+                    parent_id = (parent_client_id, parent_object_id)
+
+                sibling_set = (
+
+                    set() if additional_metadata is None else
+
+                    set(tuple(id)
+                        for id in additional_metadata.get('younger_siblings', [])))
+
+                info_list = [id, sibling_set]
+
+                if not grant_or_organization_id:
+                    info_list.append(result.total_count)
+
+                if grant_or_organization:
+                    info_list.append(result.aggregate_count)
+
+                tree_dict[parent_id].append(info_list)
+
+            for sibling_list in tree_dict.values():
+
+                sibling_list.sort(
+                    key = lambda sibling: sibling[1])
+
+            log.debug(
+                '\ntree_dict:\n' +
+                pprint.pformat(tree_dict, width = 192))
+
+            # Recursively constructing tree.
+            #
+            # If we have a tree of a single grant or a single organization, it's just simple construction.
+
+            if grant_or_organization_id:
+
+                def f(language_id):
+
+                    node_list = [
+                        None if language_id == (None, None) else language_id]
+
+                    item_list = [
+                        f(id) for id, _ in tree_dict[language_id]]
+
+                    if item_list:
+                        node_list.append(item_list)
+
+                    return node_list
+
+                tree_object = f((None, None))
+
+            # For all grants or all organizations, we construct trees for each non-empty grant/organization
+            # and a final tree containing all unaligned dictinaries.
+
+            elif grant_or_organization:
+
+                if by_grants:
+
+                    id_list = (
+
+                        DBSession
+
+                            .query(
+                                dbGrant.id)
+
+                            .filter(
+                                func.jsonb_array_length(
+                                    dbGrant.additional_metadata['participant']) > 0)
+
+                            .order_by(
+                                dbGrant.grant_number)
+
+                            .all())
+
+                else:
+
+                    id_list = (
+
+                        DBSession
+
+                            .query(
+                                dbOrganization.id)
+
+                            .filter(
+                                func.jsonb_array_length(
+                                    dbOrganization.additional_metadata['participant']) > 0,
+
+                                dbOrganization.marked_for_deletion == False)
+
+                            .order_by(
+                                dbOrganization.id)
+
+                            .all())
+
+                log.debug(f'\nid_list:\n{id_list}')
+
+                tree_object_list = []
+                language_id_set = set()
+
+                id_list = [str(id) for id, in id_list]
+                id_list.append('')
+
+                for group_id_str in id_list:
+
+                    def f(
+                        language_id,
+                        dictionary_count):
+
+                        node_list = [
+                            language_id if language_id != (None, None) else
+                            int(group_id_str) if group_id_str else
+                            None]
+
+                        item_list = []
+
+                        for id, _, total_count, aggregate_count in tree_dict[language_id]:
+
+                            group_count = (
+                                0 if not aggregate_count else
+                                aggregate_count.get(str(group_id_str), 0))
+
+                            item, count = (
+                                f(id, group_count))
+
+                            if count > 0:
+
+                                item_list.append(item)
+                                dictionary_count += count
+
+                                language_id_set.add(id)
+
+                        if item_list:
+                            node_list.append(item_list)
+
+                        return (
+                            node_list, dictionary_count)
+
+                    tree_object, _ = (
+                        f((None, None), 0))
+
+                    tree_object_list.append(
+                        tree_object)
+
+                tree_object = [
+                    None, tree_object_list]
+
+            # A single language or all languages, checking recursive dictionary counts.
+
+            else:
+
+                root_id = (
+                    tuple(language_id) if language_id else
+                    (None, None))
+
+                language_id_set = {root_id}
+
+                def f(
+                    language_id,
+                    dictionary_count):
+
+                    node_list = [
+                        None if language_id == (None, None) else language_id]
+
+                    item_list = []
+
+                    for id, _, count in tree_dict[language_id]:
+
+                        item, count = f(id, count)
+
+                        if count > 0:
+
+                            item_list.append(item)
+                            dictionary_count += count
+
+                            language_id_set.add(id)
+
+                    if item_list:
+                        node_list.append(item_list)
+
+                    return (
+                        node_list, dictionary_count)
+
+                # Root language is always returned irrespectively of if its tree actually has any dictionaries,
+                # we treat it as having a dummy dictionary count of 1.
+
+                tree_object, _ = f(root_id, 1)
+
+            log.debug(
+                '\ntree_object:\n' +
+                pprint.pformat(tree_object, width = 192))
+
+            gql_language_tree = (
+                LanguageTree(tree = tree_object))
+
+            if languages_flag:
+
+                gql_language_list = []
+
+                for result in result_list:
+
+                    if object_flag:
+
+                        language = result[0]
+
+                        id = language.id
+                        additional_metadata = language.additional_metadata
+
+                    else:
+
+                        (client_id, object_id, _, _,
+                            additional_metadata) = result[:5]
+
+                        id = (client_id, object_id)
+
+                    if (not grant_or_organization_id and
+                        id not in language_id_set):
+
+                        continue
+
+                    gql_language = Language(id = id)
+
+                    if object_flag:
+
+                        gql_language.dbObject = language
+
+                    if translations_flag:
+
+                        gql_language.translations = result.translations
+
+                    if in_toc_flag:
+
+                        gql_language.in_toc = (
+                            (additional_metadata and additional_metadata.get('toc_mark')) or
+                            id in utils.standard_language_id_set)
+
+                    gql_language_list.append(
+                        gql_language)
+
+                gql_language_tree.languages = gql_language_list
+
+            # Checking compatibility with recusive_sort(), if required.
+
+            if debug_flag:
+
+                id_list = []
+
+                def f(node):
+
+                    id_list.append(node[0])
+
+                    if len(node) > 1:
+                        for item in node[1]:
+                            f(item)
+
+                id_set = set(id_list)
+
+                reference_list = [
+
+                    (client_id, object_id)
+                    for _, client_id, object_id, _ in
+
+                        recursive_sort(
+
+                            DBSession
+
+                                .query(dbLanguage)
+
+                                .filter_by(
+                                    marked_for_deletion = False)
+
+                                .order_by(
+                                    dbLanguage.parent_client_id,
+                                    dbLanguage.parent_object_id,
+                                    dbLanguage.additional_metadata['younger_siblings'])
+
+                                .all())
+
+                    if (client_id, object_id) in id_set]
+
+                if id_list != reference_list:
+
+                    log.warn(
+                        f'\nid_list:\n{pprint.pformat(id_list, width = 192)}'
+                        f'\nreference_list:\n{pprint.pformat(reference_list, width = 192)}')
+
+                    raise NotImplementedError
+
+            # Getting dictionaries, if required.
+
+            if dictionaries_flag:
+
+                dictionary_query = (
+
+                    DBSession
+
+                        .query(
+                            dbDictionary)
+
+                        .filter(
+                            dbDictionary.marked_for_deletion == False))
+
+                if d_category is not None:
+
+                    dictionary_query = (
+
+                        dictionary_query.filter(
+                            dbDictionary.category == d_category))
+
+                if grant_or_organization_id:
+
+                    dictionary_query = (
+
+                        dictionary_query
+
+                            .filter(
+
+                                tuple_(
+                                    dbDictionary.client_id,
+                                    dbDictionary.object_id)
+
+                                    .in_(
+                                        sqlalchemy.text(f'select * from {dictionary_table_name}'))))
+
+                else:
+
+                    dictionary_query = (
+
+                        dictionary_query
+
+                            .filter(
+
+                                tuple_(
+                                    dbDictionary.parent_client_id,
+                                    dbDictionary.parent_object_id)
+
+                                    .in_(
+                                        sqlalchemy.text(f'select * from {language_table_name}'))))
+
+                if d_translations_flag:
+
+                    dictionary_query = (
+
+                        dictionary_query
+
+                            .outerjoin(
+                                dbTranslationAtom,
+
+                                and_(
+                                    dbTranslationAtom.parent_client_id == dbDictionary.translation_gist_client_id,
+                                    dbTranslationAtom.parent_object_id == dbDictionary.translation_gist_object_id,
+                                    dbTranslationAtom.marked_for_deletion == False))
+
+                            .add_columns(
+
+                                func.jsonb_object_agg(
+                                    dbTranslationAtom.locale_id,
+                                    dbTranslationAtom.content)
+
+                                    .filter(dbTranslationAtom.locale_id != None))
+
+                            .group_by(
+                                dbDictionary.client_id,
+                                dbDictionary.object_id))
+
+                if d_english_status_flag:
+
+                    dbStatusAtom = aliased(dbTranslationAtom, name = 'StatusAtom')
+
+                    # Subquerying for proper grouping if already joined for translations.
+
+                    group_by_list = [
+                        dbDictionary.client_id,
+                        dbDictionary.object_id]
+
+                    if d_translations_flag:
+
+                        dictionary_query = (
+                            dictionary_query.from_self())
+
+                        group_by_list = [
+                            dictionary_query]
+
+                    dictionary_query = (
+
+                        dictionary_query
+
+                            .outerjoin(
+                                dbStatusAtom,
+
+                                and_(
+                                    dbStatusAtom.parent_client_id == dbDictionary.state_translation_gist_client_id,
+                                    dbStatusAtom.parent_object_id == dbDictionary.state_translation_gist_object_id,
+                                    dbStatusAtom.marked_for_deletion == False,
+                                    dbStatusAtom.locale_id == 2))
+
+                            .add_columns(
+
+                                Grouping(
+                                    func.array_agg(dbStatusAtom.content)
+                                        .filter(dbStatusAtom.content != None))[1])
+
+                            .group_by(
+                                *group_by_list))
+
+                # Standard ordering, least recently created first.
+
+                dictionary_query = (
+
+                    dictionary_query.order_by(
+                        dbDictionary.created_at.desc()))
+
+                dictionary_list = dictionary_query.all()
+
+                log.debug(
+                    '\ndictionary_query:\n' +
+                    render_statement(dictionary_query.statement))
+
+                # Sorting and distributing dictionaries by languages.
+
+                gql_dictionary_dict = collections.defaultdict(list)
+
+                for result in dictionary_list:
+
+                    dictionary = (
+                        result[0] if d_translations_flag or d_english_status_flag else
+                        result)
+
+                    gql_dictionary = Dictionary(id = dictionary.id)
+                    gql_dictionary.dbObject = dictionary
+
+                    result_index = 1
+
+                    if d_translations_flag:
+
+                        gql_dictionary.translations = result[result_index]
+                        result_index += 1
+
+                    if d_english_status_flag:
+
+                        gql_dictionary.status = result[result_index]
+                        result_index += 1
+
+                    gql_dictionary_dict[
+                        dictionary.parent_id].append(gql_dictionary)
+
+                for gql_language in gql_language_list:
+
+                    gql_language.dictionaries = (
+                        gql_dictionary_dict[gql_language.id])
+
+            return gql_language_tree
+
+        except Exception as exception:
+
+            traceback_string = ''.join(traceback.format_exception(
+                exception, exception, exception.__traceback__))[:-1]
+
+            log.warning('language_tree: exception')
+            log.warning(traceback_string)
+
+            return ResponseError(message =
+                'Exception:\n' + traceback_string)
+
+    def language_toc_sql(self):
+
+        toc_table_name = (
+
+            'toc_language_ids_' +
+             str(uuid.uuid4()).replace('-', '_'))
+
+        count_table_name = (
+
+            'dictionary_counts_' +
+             str(uuid.uuid4()).replace('-', '_'))
+
+        result_table_name = (
+
+            'recursive_counts_' +
+             str(uuid.uuid4()).replace('-', '_'))
+
+        sql_str = f'''
+
+            create temporary table
+              {toc_table_name}
+              on commit drop as
+
+              with
+
+              standard_language_ids as (
+                select * from (values (1574, 116655), (33, 88), (252, 40), (1076, 4), (1574, 269058), (1068, 5), (500, 121), (1076, 22), (33, 90), (216, 8), (1574, 272286), (295, 8), (1100, 4), (1105, 28), (508, 49), (508, 39), (633, 23), (1552, 1252), (508, 46), (1733, 13468), (1501, 42640), (1501, 42646), (1311, 23), (1076, 10), (1552, 652), (508, 37), (500, 124), (500, 123), (1574, 269111), (508, 44), (508, 42), (1076, 119), (1574, 99299), (1574, 274491), (508, 45), (508, 41), (508, 40), (1076, 7), (633, 17), (1209, 24), (1209, 20), (508, 48), (508, 50), (1088, 612), (1311, 41), (1574, 203685), (1479, 599), (996, 1069), (1401, 11742), (1574, 272495), (998, 5), (1574, 116715), (508, 38), (508, 47), (1372, 10768), (508, 51), (1557, 6), (1574, 268977), (500, 122), (65, 2), (1251, 6), (1574, 116679), (633, 16), (1002, 12), (1068, 9), (1574, 269088), (1574, 203688), (1550, 3373), (508, 43), (643, 4), (33, 89), (633, 22), (508, 36), (840, 6), (1632, 6), (1372, 11240), (2108, 13), (1574, 274494), (678, 9)) V
+              )
+
+              select
+                client_id,
+                object_id,
+                parent_client_id,
+                parent_object_id
+
+              from
+                language
+
+              where
+                marked_for_deletion = false and (
+                  (additional_metadata -> 'toc_mark') :: boolean or
+                  (client_id, object_id) in (select * from standard_language_ids));
+
+            create temporary table
+              {count_table_name}
+              on commit drop as
+
+              with recursive
+
+              underlying_language_ids as (
+
+                select *
+                from {toc_table_name}
+
+                union
+
+                select
+                  L.client_id,
+                  L.object_id,
+                  L.parent_client_id,
+                  L.parent_object_id
+
+                from
+                  language L,
+                  underlying_language_ids U
+
+                where
+                  L.marked_for_deletion = false and
+                  L.parent_client_id = U.client_id and
+                  L.parent_object_id = U.object_id
+              )
+
+              select
+                L.*, count(D.*)
+
+              from
+                underlying_language_ids L
+
+              left outer join
+                dictionary D
+
+              on
+                D.parent_client_id = L.client_id and
+                D.parent_object_id = L.object_id and
+                D.marked_for_deletion = false and
+                D.category = 0
+
+              group by
+                L.client_id,
+                L.object_id,
+                L.parent_client_id,
+                L.parent_object_id;
+
+            create temporary table
+
+              {result_table_name} (
+                client_id BIGINT,
+                object_id BIGINT,
+                count BIGINT
+              )
+
+            on commit drop;
+
+            do $$
+
+            begin
+
+            while exists (
+              select 1 from {count_table_name}) loop
+
+              with
+
+              iteration_counts as (
+
+                select C1.*
+
+                  from
+                    {count_table_name} C1
+
+                  left outer join
+                    {count_table_name} C2
+
+                  on
+                    C1.client_id = C2.parent_client_id and
+                    C1.object_id = C2.parent_object_id
+
+                  where
+                    C2 is null
+              ),
+
+              delete_cte as (
+
+                delete
+
+                from
+                  {count_table_name} D
+
+                using
+                  iteration_counts I
+
+                where
+                  D.client_id = I.client_id and
+                  D.object_id = I.object_id
+              ),
+
+              update_cte as (
+
+                update
+                  {count_table_name} D
+
+                set
+                  count = D.count + S.sum
+
+                from (
+
+                  select
+                    parent_client_id,
+                    parent_object_id,
+                    sum(count)
+
+                  from
+                    iteration_counts
+
+                  group by
+                    parent_client_id,
+                    parent_object_id
+
+                ) S
+
+                where
+                  D.client_id = S.parent_client_id and
+                  D.object_id = S.parent_object_id
+              )
+
+              insert into
+                {result_table_name}
+
+              select
+                client_id,
+                object_id,
+                count
+
+              from
+                iteration_counts;
+
+            end loop;
+
+            end
+
+            $$;
+
+            select
+              R.*
+
+            from
+              {result_table_name} R,
+              {toc_table_name} T
+
+            where
+              R.client_id = T.client_id and
+              R.object_id = T.object_id;
+
+        '''
+
+        return (
+
+            DBSession
+                .execute(sql_str)
+                .fetchall())
+
+    def language_toc_python(self):
+
+        # Getting base counts.
+
+        toc_table_name = (
+
+            'toc_language_ids_' +
+             str(uuid.uuid4()).replace('-', '_'))
+
+        sql_str = f'''
+
+            create temporary table
+              {toc_table_name}
+              on commit drop as
+
+              with
+
+              standard_language_ids as (
+                select * from (values (1574, 116655), (33, 88), (252, 40), (1076, 4), (1574, 269058), (1068, 5), (500, 121), (1076, 22), (33, 90), (216, 8), (1574, 272286), (295, 8), (1100, 4), (1105, 28), (508, 49), (508, 39), (633, 23), (1552, 1252), (508, 46), (1733, 13468), (1501, 42640), (1501, 42646), (1311, 23), (1076, 10), (1552, 652), (508, 37), (500, 124), (500, 123), (1574, 269111), (508, 44), (508, 42), (1076, 119), (1574, 99299), (1574, 274491), (508, 45), (508, 41), (508, 40), (1076, 7), (633, 17), (1209, 24), (1209, 20), (508, 48), (508, 50), (1088, 612), (1311, 41), (1574, 203685), (1479, 599), (996, 1069), (1401, 11742), (1574, 272495), (998, 5), (1574, 116715), (508, 38), (508, 47), (1372, 10768), (508, 51), (1557, 6), (1574, 268977), (500, 122), (65, 2), (1251, 6), (1574, 116679), (633, 16), (1002, 12), (1068, 9), (1574, 269088), (1574, 203688), (1550, 3373), (508, 43), (643, 4), (33, 89), (633, 22), (508, 36), (840, 6), (1632, 6), (1372, 11240), (2108, 13), (1574, 274494), (678, 9)) V
+              )
+
+              select
+                client_id,
+                object_id,
+                parent_client_id,
+                parent_object_id
+
+              from
+                language
+
+              where
+                marked_for_deletion = false and (
+                  (additional_metadata -> 'toc_mark') :: boolean or
+                  (client_id, object_id) in (select * from standard_language_ids));
+
+            with recursive
+
+            underlying_language_ids as (
+
+              select *
+              from {toc_table_name}
+
+              union
+
+              select
+                L.client_id,
+                L.object_id,
+                L.parent_client_id,
+                L.parent_object_id
+
+              from
+                language L,
+                underlying_language_ids U
+
+              where
+                L.marked_for_deletion = false and
+                L.parent_client_id = U.client_id and
+                L.parent_object_id = U.object_id
+            )
+
+            select
+              U.*,
+              count(D.*)
+                filter (where D.client_id is not null)
+
+            from
+              underlying_language_ids U
+
+            left outer join
+              dictionary D
+
+            on
+              D.parent_client_id = U.client_id and
+              D.parent_object_id = U.object_id and
+              D.marked_for_deletion = false and
+              D.category = 0
+
+            group by
+              U.client_id,
+              U.object_id,
+              U.parent_client_id,
+              U.parent_object_id;
+
+        '''
+
+        count_list = (
+
+            DBSession
+                .execute(sql_str)
+                .fetchall())
+
+        from_to_dict = collections.defaultdict(list)
+        to_from_dict = {}
+
+        count_dict = {}
+
+        for client_id, object_id, parent_client_id, parent_object_id, count in count_list:
+
+            id = (client_id, object_id)
+            parent_id = (parent_client_id, parent_object_id)
+
+            from_to_dict[parent_id].append(id)
+            to_from_dict[id] = parent_id
+
+            count_dict[id] = count
+
+        # Getting language TOC ids, computing language TOC total counts.
+
+        toc_id_list = [
+
+            tuple(id) for id in
+
+                DBSession
+                    .execute(f'select client_id, object_id from {toc_table_name}')
+                    .fetchall()]
+
+        total_count_dict = {}
+
+        def f(id):
+
+            total_count = total_count_dict.get(id)
+
+            if total_count is not None:
+                return total_count
+
+            total_count = (
+
+                count_dict[id] +
+
+                sum(f(to_id)
+                    for to_id in from_to_dict[id]))
+
+            total_count_dict[id] = total_count
+
+            return total_count
+
+        return [
+            (id[0], id[1], f(id))
+            for id in toc_id_list]
+
+    def toc_translations_cache(self, toc_list):
+
+        gist_id_list = (
+
+            DBSession
+
+                .query(
+                    dbLanguage.client_id,
+                    dbLanguage.object_id,
+                    dbLanguage.translation_gist_client_id,
+                    dbLanguage.translation_gist_object_id)
+
+                .filter(
+
+                    tuple_(
+                        dbLanguage.client_id,
+                        dbLanguage.object_id)
+
+                        .in_(
+                            ids_to_id_query(
+                                (client_id, object_id)
+                                for client_id, object_id, count in toc_list)))
+
+                .all())
+
+        return {
+
+            (client_id, object_id):
+                models.get_translations(gist_client_id, gist_object_id)
+
+            for client_id, object_id, gist_client_id, gist_object_id in gist_id_list}
+
+    def toc_translations_db(self, toc_list):
+
+        translation_list = (
+
+            DBSession
+
+                .query(
+                    dbLanguage.client_id,
+                    dbLanguage.object_id,
+                    dbTranslationAtom.locale_id,
+                    dbTranslationAtom.content)
+
+                .filter(
+
+                    tuple_(
+                        dbLanguage.client_id,
+                        dbLanguage.object_id)
+
+                        .in_(
+                            ids_to_id_query(
+                                (client_id, object_id)
+                                for client_id, object_id, count in toc_list)),
+
+                    dbTranslationAtom.parent_client_id == dbLanguage.translation_gist_client_id,
+                    dbTranslationAtom.parent_object_id == dbLanguage.translation_gist_object_id,
+                    dbTranslationAtom.marked_for_deletion == False)
+
+                .all())
+
+        content_dict = collections.defaultdict(list)
+
+        for client_id, object_id, locale_id, content in translation_list:
+            content_dict[(client_id, object_id)].append((locale_id, content))
+
+        result_dict = {}
+
+        for client_id, object_id, count in toc_list:
+
+            id = (client_id, object_id)
+            content_list = content_dict.get(id)
+
+            result_dict[id] = (
+                None if content_list is None else
+                    {str(key): value for key, value in content_list})
+
+        return result_dict
+
+    def resolve_language_toc(
+        self,
+        info):
+
+        # __DEBUG__
+
+        __debug_flag__ = True
+
+        # Checking if we would need to count dictionaries, recursively.
+
+        if __debug_flag__:
+
+            log.debug(
+                f'\ninfo.field_asts:\n{info.field_asts}')
+
+        object_flag = False
+
+        selection_dict = {
+
+            'created_at': (
+                dbLanguage.created_at,),
+
+            'id': (
+                dbLanguage.client_id,
+                dbLanguage.object_id),
+
+            'marked_for_deletion': (
+                dbLanguage.marked_for_deletion,),
+
+            'parent_id': (
+                dbLanguage.parent_client_id,
+                dbLanguage.parent_object_id),
+
+            'translations': (
+                dbLanguage.translation_gist_client_id,
+                dbLanguage.translation_gist_object_id)}
+
+        selection_set = set()
+        selection_list = []
+
+        dictionary_count_flag = False
+
+        dc_recursive = None
+        dc_category = None
+        dc_published = None
+
+        def f(argument):
+
+            try:
+
+                return argument.value.value
+
+            except AttributeError:
+
+                return (
+
+                    info.variable_values.get(
+                        argument.value.name.value, None))
+
+        for field in info.field_asts:
+
+            if field.name.value != 'language_toc':
+                continue
+
+            for subfield in field.selection_set.selections:
+
+                name_str = subfield.name.value
+
+                if name_str in selection_dict:
+
+                    selection_set.add(name_str)
+                    selection_list.extend(selection_dict[name_str])
+
+                elif name_str == 'dictionary_count':
+
+                    selection_set.add('dictionary_count')
+                    dictionary_count_flag = True
+
+                    for argument in subfield.arguments:
+
+                        name_str = argument.name.value
+
+                        if name_str == 'recursive':
+                            dc_recursive = f(argument)
+
+                        elif name_str == 'category':
+                            dc_category = f(argument)
+
+                        elif name_str == 'published':
+                            dc_published = f(argument)
+
+                        else:
+
+                            selection_set.remove('dictionary_count')
+                            dictionary_count_flag = False
+
+                            break
+
+                elif name_str != '__typename':
+
+                    object_flag = True
+
+        if object_flag:
+
+            selection_list = [dbLanguage]
+
+        elif 'id' not in selection_set:
+
+            # For ToC inclusion checking.
+
+            selection_set.add('id')
+            selection_list.extend(selection_dict['id'])
+
+        translations_flag = (
+            'translations' in selection_set)
+
+        id_list_str = (
+
+            ', '.join(
+                f'({id[0]}, {id[1]})'
+                for id in utils.standard_language_id_list))
+
+        # If we are not counting dictionaries or the count is not recursive, it's relatively simple.
+
+        if not dictionary_count_flag or not dc_recursive:
+
+            language_query = (
+
+                DBSession
+
+                    .query(
+                        *selection_list)
+
+                    .filter(
+                        dbLanguage.marked_for_deletion == False,
+
+                        or_(
+                            cast(
+                                dbLanguage.additional_metadata['toc_mark'],
+                                Boolean),
+
+                            tuple_(
+                                dbLanguage.client_id,
+                                dbLanguage.object_id)
+
+                                .in_(
+                                    sqlalchemy.text(
+                                        f'select * from (values {id_list_str}) V')))))
+
+            language_cte = None
+            language_c = dbLanguage
+
+            # If we are getting both dictionary counts and translations through outer joins, we would need
+            # a CTE.
+
+            if dictionary_count_flag and translations_flag:
+
+                language_cte = language_query.cte()
+                language_c = language_cte.c
+
+                if object_flag:
+
+                    language_cte = (
+
+                        aliased(
+                            dbLanguage,
+                            language_cte,
+                            adapt_on_names = True))
+
+                    language_c = language_cte
+
+                language_query = (
+                    DBSession.query(language_cte))
+
+            # Getting dictionary counts if required, with additional conditions on dictionaries if
+            # specified.
+
+            if dictionary_count_flag:
+
+                dictionary_condition_list = []
+
+                if dc_category is not None:
+
+                    dictionary_condition_list.append(
+                        dbDictionary.category == dc_category)
+
+                if dc_published is not None:
+
+                    if not dc_published:
+                        raise NotImplementedError
+
+                    dictionary_condition_list.append(
+
+                        tuple_(
+                            dbDictionary.state_translation_gist_client_id,
+                            dbDictionary.state_translation_gist_object_id)
+
+                            .in_(published_translation_gist_id_query))
+
+                if language_cte is not None:
+
+                    count_query = (
+
+                        DBSession
+
+                            .query(
+                                language_c.client_id,
+                                language_c.object_id)
+
+                            .outerjoin(
+                                dbDictionary,
+
+                                and_(
+                                    dbDictionary.parent_client_id == language_c.client_id,
+                                    dbDictionary.parent_object_id == language_c.object_id,
+                                    dbDictionary.marked_for_deletion == False,
+                                    *dictionary_condition_list))
+
+                            .add_columns(
+
+                                func.count()
+                                    .filter(dbDictionary.client_id != None)
+                                    .label('dictionary_count'))
+
+                            .group_by(
+                                language_c.client_id,
+                                language_c.object_id)
+
+                            .subquery())
+
+                    language_query = (
+
+                        language_query
+
+                            .join(
+                                count_query,
+
+                                and_(
+                                    count_query.c.client_id == language_c.client_id,
+                                    count_query.c.object_id == language_c.object_id))
+
+                            .add_columns(
+                                count_query.c.dictionary_count))
+
+                else:
+
+                    language_query = (
+
+                        language_query
+
+                            .outerjoin(
+                                dbDictionary,
+
+                                and_(
+                                    dbDictionary.parent_client_id == language_c.client_id,
+                                    dbDictionary.parent_object_id == language_c.object_id,
+                                    dbDictionary.marked_for_deletion == False,
+                                    *dictionary_condition_list))
+
+                            .add_columns(
+
+                                func.count()
+                                    .filter(dbDictionary.client_id != None)
+                                    .label('dictionary_count'))
+
+                            .group_by(
+                                language_c.client_id,
+                                language_c.object_id))
+
+            if translations_flag:
+
+                if language_cte is not None:
+
+                    translation_query = (
+
+                        DBSession
+
+                            .query(
+                                language_c.client_id,
+                                language_c.object_id)
+
+                            .outerjoin(
+                                dbTranslationAtom,
+
+                                and_(
+                                    dbTranslationAtom.parent_client_id == language_c.translation_gist_client_id,
+                                    dbTranslationAtom.parent_object_id == language_c.translation_gist_object_id,
+                                    dbTranslationAtom.marked_for_deletion == False))
+
+                            .add_columns(
+
+                                func.jsonb_object_agg(
+                                    dbTranslationAtom.locale_id,
+                                    dbTranslationAtom.content)
+
+                                    .filter(dbTranslationAtom.locale_id != None)
+                                    .label('translations'))
+
+                            .group_by(
+                                language_c.client_id,
+                                language_c.object_id)
+
+                            .subquery())
+
+                    language_query = (
+
+                        language_query
+
+                            .join(
+                                translation_query,
+
+                                and_(
+                                    translation_query.c.client_id == language_c.client_id,
+                                    translation_query.c.object_id == language_c.object_id))
+
+                            .add_columns(
+                                translation_query.c.translations))
+
+                else:
+
+                    language_query = (
+
+                        language_query
+
+                            .outerjoin(
+                                dbTranslationAtom,
+
+                                and_(
+                                    dbTranslationAtom.parent_client_id == language_c.translation_gist_client_id,
+                                    dbTranslationAtom.parent_object_id == language_c.translation_gist_object_id,
+                                    dbTranslationAtom.marked_for_deletion == False))
+
+                            .add_columns(
+
+                                func.jsonb_object_agg(
+                                    dbTranslationAtom.locale_id,
+                                    dbTranslationAtom.content)
+
+                                    .filter(dbTranslationAtom.locale_id != None)
+                                    .label('translations'))
+
+                            .group_by(
+                                language_c.client_id,
+                                language_c.object_id))
+
+            # Getting language info, preparing it for GraphQL.
+
+            result_list = language_query.all()
+
+            if __debug_flag__:
+
+                log.debug(
+                    '\nlanguage_query:\n' +
+                    render_statement(language_query.statement))
+
+            gql_language_list = []
+
+            if object_flag:
+
+                # We are getting full ORM dbLanguage objects.
+
+                attribute_set = selection_set.copy()
+
+                attribute_set.discard('dictionary_count')
+                attribute_set.discard('translations')
+
+                for result in result_list:
+
+                    language = (
+                        result[0] if dictionary_count_flag or translations_flag else
+                        result)
+
+                    gql_language = (
+                        Language(id = language.id))
+
+                    gql_language.dbObject = language
+
+                    if dictionary_count_flag:
+
+                        gql_language.dictionary_count = result.dictionary_count
+
+                    if translations_flag:
+
+                        gql_language.translations = result.translations
+
+                    for attribute in attribute_set:
+
+                        value = getattr(language, attribute)
+
+                        if attribute == 'created_at':
+
+                            value = CreatedAt.from_timestamp(value)
+
+                        setattr(
+                            gql_language,
+                            attribute,
+                            value)
+
+                    gql_language_list.append(gql_language)
+
+            else:
+
+                # We are getting attribute values as they are.
+
+                for result in result_list:
+
+                    id = (
+                        result.client_id, result.object_id)
+
+                    gql_language = (
+                        Language(id = id))
+
+                    for selection in selection_set:
+
+                        if selection == 'id':
+
+                            gql_language.id = id
+
+                            continue
+
+                        elif selection == 'parent_id':
+
+                            gql_language.parent_id = (
+                                result.parent_client_id,
+                                result.parent_object_id)
+
+                            continue
+
+                        value = getattr(result, selection)
+
+                        if selection == 'created_at':
+
+                            value = CreatedAt.from_timestamp(value)
+
+                        setattr(
+                            gql_language,
+                            selection,
+                            value)
+
+                    gql_language_list.append(gql_language)
+
+            return gql_language_list
+
+        # And this if we have to get recursive dictionary counts.
+        #
+        # Starting with temporary table we'll get eventual language data from and base dictionary counts
+        # we'll need.
+
+        language_table_name = (
+
+            'language_toc_' +
+             str(uuid.uuid4()).replace('-', '_'))
+
+        if object_flag:
+
+            selection_str = '*'
+
+        else:
+
+            if 'parent_id' not in selection_set:
+
+                # For recursive dictionary counts computation.
+
+                selection_set.add('parent_id')
+                selection_list.extend(selection_dict['parent_id'])
+
+            selection_str = (
+
+                ', '.join(
+                    f'{selection.name}'
+                    for selection in selection_list))
+
+        dictionary_condition_list = []
+
+        if dc_category is not None:
+
+            dictionary_condition_list.append(
+                f'\n and D.category = {dc_category}')
+
+        if dc_published is not None:
+
+            if not dc_published:
+                raise NotImplementedError
+
+            dictionary_condition_list.append(f'''
+
+                and (
+                  D.state_translation_gist_client_id,
+                  D.state_translation_gist_object_id) in (
+
+                  select
+                    T.client_id,
+                    T.object_id
+
+                  from
+                    translationgist T,
+                    translationatom A
+
+                  where
+                    T.marked_for_deletion = false and
+                    T.type = 'Service' and
+                    A.parent_client_id = T.client_id and
+                    A.parent_object_id = T.object_id and
+                    A.locale_id = 2 and
+                    A.marked_for_deletion = false and (
+                      A.content = 'Published' or
+                      A.content = 'Limited access'))
+
+                ''')
+
+        dictionary_condition_str = (
+            ''.join(dictionary_condition_list))
+
+        sql_str = f'''
+
+            create temporary table
+              {language_table_name}
+              on commit drop as
+
+              select
+                {selection_str}
+
+              from
+                language
+
+              where
+                marked_for_deletion = false and (
+                  (additional_metadata -> 'toc_mark') :: boolean or
+                  (client_id, object_id) in (select * from (values {id_list_str}) V));
+
+            with recursive
+
+            underlying_language_ids as (
+
+              select
+                client_id,
+                object_id,
+                parent_client_id,
+                parent_object_id
+
+              from
+                {language_table_name}
+
+              union
+
+              select
+                L.client_id,
+                L.object_id,
+                L.parent_client_id,
+                L.parent_object_id
+
+              from
+                language L,
+                underlying_language_ids U
+
+              where
+                L.marked_for_deletion = false and
+                L.parent_client_id = U.client_id and
+                L.parent_object_id = U.object_id
+            )
+
+            select
+              U.*,
+              count(D.*)
+                filter (where D.client_id is not null)
+
+            from
+              underlying_language_ids U
+
+            left outer join
+              dictionary D
+
+            on
+              D.parent_client_id = U.client_id and
+              D.parent_object_id = U.object_id and
+              D.marked_for_deletion = false {dictionary_condition_str}
+
+            group by
+              U.client_id,
+              U.object_id,
+              U.parent_client_id,
+              U.parent_object_id;
+
+            '''
+
+        count_list = (
+
+            DBSession
+                .execute(sql_str)
+                .fetchall())
+
+        from_to_dict = collections.defaultdict(list)
+        to_from_dict = {}
+
+        count_dict = {}
+
+        for client_id, object_id, parent_client_id, parent_object_id, count in count_list:
+
+            id = (client_id, object_id)
+            parent_id = (parent_client_id, parent_object_id)
+
+            from_to_dict[parent_id].append(id)
+            to_from_dict[id] = parent_id
+
+            count_dict[id] = count
+
+        # Getting language data, computing recursive total counts.
+        #
+        # NOTE:
+        #
+        # We have two ways to compute language TOC with recursive dictionary counts, fully on SQL side and
+        # partially on Python side.
+        #
+        # There were doubts about efficiency, fully SQL computation required 3 temporary tables and a big
+        # SQL script, partially Python computation has only 1 temporary table, will receive raw dictionary
+        # counts for 400+ related languages with their ids and parent ids, and transfer around 100 less
+        # lines of SQL to the DB.
+        #
+        # Testing (with log level WARN instead of DEBUG):
+        #
+        #   t0 = time.time()
+        #
+        #   for i in range(256):
+        #       Query.language_toc_sql(self)
+        #
+        #   t1 = time.time()
+        #
+        #   result_1 = (
+        #       sorted(Query.language_toc_sql(self)))
+        #
+        #   print(len(result_1))
+        #   pprint.pprint(result_1, width = 192)
+        #   print(hashlib.md5(repr(result_1).encode('utf-8')).hexdigest())
+        #
+        #   t2 = time.time()
+        #
+        #   for i in range(256):
+        #       Query.language_toc_python(self)
+        #
+        #   t3 = time.time()
+        #
+        #   result_2 = (
+        #       sorted(Query.language_toc_python(self)))
+        #
+        #   print(len(result_2))
+        #   pprint.pprint(result_2, width = 192)
+        #   print(hashlib.md5(repr(result_2).encode('utf-8')).hexdigest())
+        #
+        #   log.debug(
+        #       f'\nt1 - t0: {t1 - t0:.6f}s'
+        #       f'\nt3 - t2: {t3 - t2:.6f}s')
+        #
+        # Looks like language_toc_python() is about 20% faster.
+        #
+        # NOTE:
+        #
+        # Testing getting translations (with log level WARN instead of DEBUG):
+        #
+        #   t0 = time.time()
+        #
+        #   for i in range(256):
+        #       Query.toc_translations_cache(self, toc_list)
+        #
+        #   t1 = time.time()
+        #
+        #   result_1 = Query.toc_translations_cache(self, toc_list)
+        #
+        #   print(len(result_1))
+        #
+        #   result_1_sorted = (
+        #
+        #       sorted(
+        #           (key, None if value is None else sorted(value.items()))
+        #           for key, value in result_1.items()))
+        #
+        #   pprint.pprint(result_1_sorted, width = 192)
+        #
+        #   print(
+        #       hashlib.md5(
+        #           repr(result_1_sorted).encode('utf-8'))
+        #           .hexdigest())
+        #
+        #   t2 = time.time()
+        #
+        #   for i in range(256):
+        #       Query.toc_translations_db(self, toc_list)
+        #
+        #   t3 = time.time()
+        #
+        #   result_2 = Query.toc_translations_db(self, toc_list)
+        #
+        #   print(len(result_2))
+        #
+        #   result_2_sorted = (
+        #
+        #       sorted(
+        #           (key, None if value is None else sorted(value.items()))
+        #           for key, value in result_2.items()))
+        #
+        #   pprint.pprint(result_2_sorted, width = 192)
+        #
+        #   print(
+        #       hashlib.md5(
+        #           repr(result_2_sorted).encode('utf-8'))
+        #           .hexdigest())
+        #
+        #   log.debug(
+        #       f'\nt1 - t0: {t1 - t0:.6f}s'
+        #       f'\nt3 - t2: {t3 - t2:.6f}s')
+        #
+        # Looks like toc_translations_db() is about 2-3 times faster.
+        #
+        # So if possible, we should get translations from DB.
+        #
+
+        sql_text = (
+
+            sqlalchemy.text(
+                f'select * from {language_table_name}'))
+
+        if object_flag:
+
+            sql_text = (
+
+                aliased(
+                    dbLanguage,
+
+                    sql_text
+
+                        .columns(
+                            **{column.name: column.type
+                                for column in dbGrant.__table__.c})
+
+                        .alias(),
+
+                    adapt_on_names = True))
+
+        else:
+
+            sql_text = (
+
+                sql_text
+
+                    .columns(
+                        *selection_list)
+
+                    .alias())
+
+        language_query = (
+
+            DBSession
+                .query(sql_text))
+
+        # Getting translations through join, if required.
+
+        if translations_flag:
+
+            language_query = (
+
+                language_query
+
+                    .outerjoin(
+                        dbTranslationAtom,
+
+                        and_(
+                            dbTranslationAtom.parent_client_id == dbLanguage.translation_gist_client_id,
+                            dbTranslationAtom.parent_object_id == dbLanguage.translation_gist_object_id,
+                            dbTranslationAtom.marked_for_deletion == False))
+
+                    .add_columns(
+
+                        func.jsonb_object_agg(
+                            dbTranslationAtom.locale_id,
+                            dbTranslationAtom.content)
+
+                            .filter(dbTranslationAtom.locale_id != None)
+                            .label('translations'))
+
+                    .group_by(
+                        dbLanguage.client_id,
+                        dbLanguage.object_id))
+
+        # Computing recursive counts from language data.
+
+        # __DEBUG__
+
+        log.debug(
+            '\nlanguage_query:\n' +
+            render_statement(language_query.statement))
+
+        result_list = language_query.all()
+
+        if __debug_flag__:
+
+            log.debug(
+                '\nlanguage_query:\n' +
+                render_statement(language_query.statement))
+
+        total_count_dict = {}
+
+        def f(id):
+
+            total_count = total_count_dict.get(id)
+
+            if total_count is not None:
+                return total_count
+
+            total_count = (
+
+                count_dict[id] +
+
+                sum(f(to_id)
+                    for to_id in from_to_dict[id]))
+
+            total_count_dict[id] = total_count
+
+            return total_count
+
+        gql_language_list = []
+
+        if object_flag:
+
+            # We are getting full ORM dbLanguage objects.
+
+            attribute_set = selection_set.copy()
+
+            attribute_set.discard('dictionary_count')
+            attribute_set.discard('translations')
+
+            for result in result_list:
+
+                language = (
+                    result[0] if dictionary_count_flag or translations_flag else
+                    result)
+
+                gql_language = (
+                    Language(id = language.id))
+
+                gql_language.dbObject = language
+
+                if dictionary_count_flag:
+
+                    gql_language.dictionary_count = f(language.id)
+
+                if translations_flag:
+
+                    gql_language.translations = result.translations
+
+                for attribute in attribute_set:
+
+                    value = getattr(language, attribute)
+
+                    if attribute == 'created_at':
+
+                        value = CreatedAt.from_timestamp(value)
+
+                    setattr(
+                        gql_language,
+                        attribute,
+                        value)
+
+                gql_language_list.append(gql_language)
+
+        else:
+
+            # We are getting attribute values as they are.
+
+            for result in result_list:
+
+                id = (
+                    result.client_id, result.object_id)
+
+                gql_language = (
+                    Language(id = id))
+
+                for selection in selection_set:
+
+                    if selection == 'dictionary_count':
+
+                        gql_language.dictionary_count = f(id)
+
+                        continue
+
+                    elif selection == 'id':
+
+                        gql_language.id = id
+
+                        continue
+
+                    elif selection == 'parent_id':
+
+                        gql_language.parent_id = (
+                            result.parent_client_id,
+                            result.parent_object_id)
+
+                        continue
+
+                    value = getattr(result, selection)
+
+                    if selection == 'created_at':
+
+                        value = CreatedAt.from_timestamp(value)
+
+                    setattr(
+                        gql_language,
+                        selection,
+                        value)
+
+                gql_language_list.append(gql_language)
+
+        return gql_language_list
 
     def resolve_valency_data(
         self,
@@ -1454,7 +4049,12 @@ class Query(graphene.ObjectType):
         return Permissions(limited=limited, view=view, edit=edit, publish=publish)
 
 
-    def resolve_language_tree(self, info):
+    def resolve_language_order(self, info):
+
+        # __DEBUG__
+
+        raise NotImplementedError
+
         langs = DBSession.query(dbLanguage).filter_by(marked_for_deletion=False).order_by(dbLanguage.parent_client_id,
                                                                                         dbLanguage.parent_object_id,
                                                                                         dbLanguage.additional_metadata[
@@ -1475,6 +4075,7 @@ class Query(graphene.ObjectType):
             errors = [(lang.client_id, lang.object_id) for lang in langs if (lang.client_id, lang.object_id) not in lang_set]
             print(errors)
         return result
+
 
     def resolve_advanced_search(
         self,
@@ -1694,30 +4295,37 @@ class Query(graphene.ObjectType):
         client_id = info.context.get('client_id')
         client = DBSession.query(Client).filter_by(id=client_id).first()
 
-        dbdicts = None
+        dbdicts = (
+
+            DBSession
+                .query(dbDictionary)
+                .filter_by(marked_for_deletion = False))
+
         if published:
-            db_published_gist = translation_gist_search('Published')
-            state_translation_gist_client_id = db_published_gist.client_id
-            state_translation_gist_object_id = db_published_gist.object_id
-            db_la_gist = translation_gist_search('Limited access')
-            limited_client_id, limited_object_id = db_la_gist.client_id, db_la_gist.object_id
 
+            dbdicts = (
 
-            dbdicts = DBSession.query(dbDictionary).filter(dbDictionary.marked_for_deletion == False).filter(
-                or_(and_(dbDictionary.state_translation_gist_object_id == state_translation_gist_object_id,
-                         dbDictionary.state_translation_gist_client_id == state_translation_gist_client_id),
-                    and_(dbDictionary.state_translation_gist_object_id == limited_object_id,
-                         dbDictionary.state_translation_gist_client_id == limited_client_id))). \
-                join(dbPerspective) \
-                .filter(or_(and_(dbPerspective.state_translation_gist_object_id == state_translation_gist_object_id,
-                                 dbPerspective.state_translation_gist_client_id == state_translation_gist_client_id),
-                            and_(dbPerspective.state_translation_gist_object_id == limited_object_id,
-                                 dbPerspective.state_translation_gist_client_id == limited_client_id))). \
-                filter(dbPerspective.marked_for_deletion == False)
+                dbdicts
 
-        else:
-            if not dbdicts:
-                dbdicts = DBSession.query(dbDictionary).filter(dbDictionary.marked_for_deletion == False)
+                    .filter(
+                        tuple_(
+                            dbDictionary.state_translation_gist_client_id,
+                            dbDictionary.state_translation_gist_object_id)
+
+                            .in_(published_translation_gist_id_cte_query))
+
+                    .join(dbPerspective)
+
+                    .filter(
+                        dbPerspective.marked_for_deletion == False,
+
+                        tuple_(
+                            dbPerspective.state_translation_gist_client_id,
+                            dbPerspective.state_translation_gist_object_id)
+
+                            .in_(published_translation_gist_id_cte_query))
+
+                    .group_by(dbDictionary))
 
         if category is not None:
             if category:
@@ -1993,7 +4601,15 @@ class Query(graphene.ObjectType):
     def resolve_language(self, info, id):
         return Language(id=id)
 
-    def resolve_languages(self, info, id_list = None):
+    def resolve_languages(
+        self,
+        info,
+        id_list = None,
+        standard_order = False,
+        only_in_toc = False,
+        only_with_dictionaries_recursive = False,
+        dictionary_category = None,
+        dictionary_published = None):
         """
         example:
 
@@ -2006,57 +4622,694 @@ class Query(graphene.ObjectType):
             }
         }
         """
-        context = info.context
 
-        if id_list is None:
-          languages = DBSession.query(dbLanguage).filter_by(marked_for_deletion = False).all()
+        try:
 
-        # We are requested to get a set of languages specified by ids.
+            # __DEBUG__
 
-        else:
-          languages_all = DBSession.query(dbLanguage).filter(
-            tuple_(dbLanguage.client_id, dbLanguage.object_id).in_(id_list)).all()
+            __debug_flag__ = True
 
-          language_id_set = set(
-            tuple(id) for id in id_list)
+            # Analyzing query.
 
-          languages = []
-          deleted_id_list = []
+            if __debug_flag__:
 
-          # Checking which ids do not correspond to languages, and which are of deleted languages.
+                log.debug(
+                    f'\ninfo.field_asts:\n{info.field_asts}')
 
-          for language in languages_all:
+            object_flag = False
 
-            language_id = (language.client_id, language.object_id)
-            language_id_set.remove(language_id)
+            selection_dict = {
 
-            if language.marked_for_deletion:
-              deleted_id_list.append(language_id)
+                'additional_metadata': (
+                    dbLanguage.additional_metadata,),
+
+                'created_at': (
+                    dbLanguage.created_at,),
+
+                'id': (
+                    dbLanguage.client_id,
+                    dbLanguage.object_id),
+
+                'in_toc': (
+                    dbLanguage.additional_metadata,),
+
+                'marked_for_deletion': (
+                    dbLanguage.marked_for_deletion,),
+
+                'parent_id': (
+                    dbLanguage.parent_client_id,
+                    dbLanguage.parent_object_id),
+
+                'translations': (
+                    dbLanguage.translation_gist_client_id,
+                    dbLanguage.translation_gist_object_id)}
+
+            selection_field_set = set()
+            selection_column_set = set()
+
+            selection_list = []
+
+            def selection(field_str):
+
+                if field_str in selection_field_set:
+                    return
+
+                selection_field_set.add(field_str)
+
+                for column in selection_dict[field_str]:
+
+                    if column not in selection_column_set:
+
+                        selection_column_set.add(column)
+                        selection_list.append(column)
+
+            dictionary_count_flag = False
+
+            dc_recursive = None
+            dc_category = None
+            dc_published = None
+
+            def f(argument):
+
+                try:
+
+                    return argument.value.value
+
+                except AttributeError:
+
+                    return (
+
+                        info.variable_values.get(
+                            argument.value.name.value, None))
+
+            for field in info.field_asts:
+
+                if field.name.value != 'languages':
+                    continue
+
+                for subfield in field.selection_set.selections:
+
+                    name_str = subfield.name.value
+
+                    if name_str in selection_dict:
+
+                        selection(name_str)
+
+                    elif name_str == 'dictionary_count':
+
+                        selection_field_set.add('dictionary_count')
+                        dictionary_count_flag = True
+
+                        for argument in subfield.arguments:
+
+                            name_str = argument.name.value
+
+                            if name_str == 'recursive':
+                                dc_recursive = f(argument)
+
+                            elif name_str == 'category':
+                                dc_category = f(argument)
+
+                            elif name_str == 'published':
+                                dc_published = f(argument)
+
+                            else:
+
+                                selection_field_set.remove('dictionary_count')
+                                dictionary_count_flag = False
+
+                                break
+
+                    elif name_str != '__typename':
+
+                        object_flag = True
+
+            total_count_flag = (
+
+                only_with_dictionaries_recursive or
+                dictionary_count_flag and dc_recursive)
+
+            if object_flag:
+
+                selection_list = [dbLanguage]
 
             else:
-              languages.append(language)
 
-          # Showing gathered info.
+                # For ToC inclusion checking.
 
-          log.debug(
-            '\nlanguages:'
-            '\n{0} ids:\n{1}'
-            '\n{2} missed:\n{3}'
-            '\n{4} deleted:\n{5}'.format(
-            len(id_list),
-            pprint.pformat(id_list, width = 108),
-            len(language_id_set),
-            pprint.pformat(sorted(language_id_set), width = 108),
-            len(deleted_id_list),
-            pprint.pformat(deleted_id_list, width = 108)))
+                if 'in_toc' in selection_field_set:
 
-        languages_list = list()
-        for db_lang in languages:
-            gql_lang = Language(id=[db_lang.client_id, db_lang.object_id])
-            gql_lang.dbObject = db_lang
-            languages_list.append(gql_lang)
+                    selection('id')
+                    selection('additional_metadata')
 
-        return languages_list
+                # For standard ordering.
+
+                if standard_order:
+
+                    selection('additional_metadata')
+
+                # For computing recursive dictionary counts.
+
+                if total_count_flag:
+
+                    selection('parent_id')
+
+            # Base language query.
+
+            language_query = (
+
+                DBSession
+
+                    .query(
+                        *selection_list)
+
+                    .filter_by(
+                        marked_for_deletion = False))
+
+            if id_list is not None:
+
+                raise NotImplementedError
+
+                language_query = (
+
+                    language_query.filter(
+
+                        tuple_(
+                            dbLanguage.client_id, dbLanguage.object_id)
+
+                            .in_(
+                                ids_to_id_query(id_list))))
+
+            if only_in_toc:
+
+                raise NotImplementedError
+
+            if (only_with_dictionaries_recursive and
+                dictionary_count_flag and (
+                    not dc_recursive or
+                    dc_category != dictionary_category or
+                    dc_published != dictionary_published)):
+
+                raise NotImplementedError
+
+            # If we are going to query both translations and dictionary counts, we'll need to use separate
+            # joins to a base CTE.
+
+            translations_flag = (
+                'translations' in selection_field_set)
+
+            cte_flag = (
+                translations_flag and
+                dictionary_count_flag)
+
+            language_cte = None
+            language_c = language_query
+
+            # Establishing a CTE if we'll need it.
+
+            if cte_flag:
+
+                language_cte = language_query.cte()
+                language_c = language_cte.c
+
+                if object_flag:
+
+                    language_cte = (
+
+                        aliased(
+                            dbLanguage,
+                            language_cte,
+                            adapt_on_names = True))
+
+                    language_c = language_cte
+
+                language_query = (
+                    DBSession.query(language_cte))
+
+            # Getting translations through a join, if required.
+
+            if translations_flag:
+
+                if language_cte is not None:
+
+                    translation_query = (
+
+                        DBSession
+
+                            .query(
+                                language_c.client_id,
+                                language_c.object_id)
+
+                            .outerjoin(
+                                dbTranslationAtom,
+
+                                and_(
+                                    dbTranslationAtom.parent_client_id == language_c.translation_gist_client_id,
+                                    dbTranslationAtom.parent_object_id == language_c.translation_gist_object_id,
+                                    dbTranslationAtom.marked_for_deletion == False))
+
+                            .add_columns(
+
+                                func.jsonb_object_agg(
+                                    dbTranslationAtom.locale_id,
+                                    dbTranslationAtom.content)
+
+                                    .filter(dbTranslationAtom.locale_id != None)
+                                    .label('translations'))
+
+                            .group_by(
+                                language_c.client_id,
+                                language_c.object_id)
+
+                            .subquery())
+
+                    language_query = (
+
+                        language_query
+
+                            .join(
+                                translation_query,
+
+                                and_(
+                                    translation_query.c.client_id == language_c.client_id,
+                                    translation_query.c.object_id == language_c.object_id))
+
+                            .add_columns(
+                                translation_query.c.translations))
+
+                else:
+
+                    language_query = (
+
+                        language_query
+
+                            .outerjoin(
+                                dbTranslationAtom,
+
+                                and_(
+                                    dbTranslationAtom.parent_client_id == language_c.translation_gist_client_id,
+                                    dbTranslationAtom.parent_object_id == language_c.translation_gist_object_id,
+                                    dbTranslationAtom.marked_for_deletion == False))
+
+                            .add_columns(
+
+                                func.jsonb_object_agg(
+                                    dbTranslationAtom.locale_id,
+                                    dbTranslationAtom.content)
+
+                                    .filter(dbTranslationAtom.locale_id != None)
+                                    .label('translations'))
+
+                            .group_by(
+                                language_c.client_id,
+                                language_c.object_id))
+
+            # Getting dictionary counts through a join, if required.
+
+            if dictionary_count_flag:
+
+                dictionary_condition_list = []
+
+                if dc_category is not None:
+
+                    dictionary_condition_list.append(
+                        dbDictionary.category == dc_category)
+
+                if dc_published is not None:
+
+                    if not dc_published:
+                        raise NotImplementedError
+
+                    dictionary_condition_list.append(
+
+                        tuple_(
+                            dbDictionary.state_translation_gist_client_id,
+                            dbDictionary.state_translation_gist_object_id)
+
+                            .in_(published_translation_gist_id_query))
+
+                if language_cte is not None:
+
+                    count_query = (
+
+                        DBSession
+
+                            .query(
+                                language_c.client_id,
+                                language_c.object_id)
+
+                            .outerjoin(
+                                dbDictionary,
+
+                                and_(
+                                    dbDictionary.parent_client_id == language_c.client_id,
+                                    dbDictionary.parent_object_id == language_c.object_id,
+                                    dbDictionary.marked_for_deletion == False,
+                                    *dictionary_condition_list))
+
+                            .add_columns(
+
+                                func.count()
+                                    .filter(dbDictionary.client_id != None)
+                                    .label('dictionary_count'))
+
+                            .group_by(
+                                language_c.client_id,
+                                language_c.object_id)
+
+                            .subquery())
+
+                    language_query = (
+
+                        language_query
+
+                            .join(
+                                count_query,
+
+                                and_(
+                                    count_query.c.client_id == language_c.client_id,
+                                    count_query.c.object_id == language_c.object_id))
+
+                            .add_columns(
+                                count_query.c.dictionary_count))
+
+                else:
+
+                    language_query = (
+
+                        language_query
+
+                            .outerjoin(
+                                dbDictionary,
+
+                                and_(
+                                    dbDictionary.parent_client_id == language_c.client_id,
+                                    dbDictionary.parent_object_id == language_c.object_id,
+                                    dbDictionary.marked_for_deletion == False,
+                                    *dictionary_condition_list))
+
+                            .add_columns(
+
+                                func.count()
+                                    .filter(dbDictionary.client_id != None)
+                                    .label('dictionary_count'))
+
+                            .group_by(
+                                language_c.client_id,
+                                language_c.object_id))
+
+            # Getting language data.
+
+            result_list = language_query.all()
+
+            if __debug_flag__:
+
+                log.debug(
+                    '\nlanguage_query:\n' +
+                    render_statement(language_query.statement))
+
+            # Computing recursive counts from language data, if required.
+
+            if total_count_flag:
+
+                from_to_dict = collections.defaultdict(list)
+                to_from_dict = {}
+
+                count_dict = {}
+
+                for result in result_list:
+
+                    if object_flag:
+
+                        language = result[0]
+
+                        id = language.id
+                        parent_id = language.parent_id
+
+                    else:
+
+                        id = (
+                            result.client_id, result.object_id)
+
+                        parent_id = (
+                            result.parent_client_id, result.parent_object_id)
+
+                    from_to_dict[parent_id].append(id)
+                    to_from_dict[id] = parent_id
+
+                    count_dict[id] = result.dictionary_count
+
+                total_count_dict = {}
+
+                def f(id):
+
+                    total_count = total_count_dict.get(id)
+
+                    if total_count is not None:
+                        return total_count
+
+                    total_count = (
+
+                        count_dict[id] +
+
+                        sum(f(to_id)
+                            for to_id in from_to_dict[id]))
+
+                    total_count_dict[id] = total_count
+
+                    return total_count
+
+            gql_language_list = []
+
+            in_toc_flag = (
+                'in_toc' in selection_field_set)
+
+            if in_toc_flag:
+
+                selection_field_set.discard('additional_metadata')
+                selection_field_set.discard('in_toc')
+
+            if object_flag:
+
+                # We are getting full ORM dbLanguage objects.
+
+                attribute_set = selection_field_set.copy()
+
+                attribute_set.discard('dictionary_count')
+                attribute_set.discard('translations')
+
+                for result in result_list:
+
+                    language = (
+                        result[0] if dictionary_count_flag or translations_flag else
+                        result)
+
+                    language_id = language.id
+
+                    # Getting dictionary docunt if required, recursive or not, filtering based on it if
+                    # required. 
+
+                    if total_count_flag:
+
+                        dictionary_count = f(language_id)
+
+                    elif dictionary_count_flag:
+
+                        dictionary_count = result.dictionary_count
+
+                    if (only_with_dictionaries_recursive and
+                        dictionary_count <= 0):
+
+                        continue
+
+                    gql_language = (
+                        Language(id = language_id))
+
+                    gql_language.dbObject = language
+
+                    # Computed attributes.
+
+                    if in_toc_flag:
+
+                        metadata = (
+                            result.additional_metadata)
+
+                        gql_language.in_toc = (
+                            language_id in utils.standard_language_id_set or
+                            metadata and metadata.get('toc_mark'))
+
+                        gql_language.additional_metadata = metadata
+
+                    if dictionary_count_flag:
+
+                        gql_language.dictionary_count = dictionary_count
+
+                    if translations_flag:
+
+                        gql_language.translations = result.translations
+
+                    # Standard attributes.
+
+                    for attribute in attribute_set:
+
+                        value = getattr(language, attribute)
+
+                        if attribute == 'created_at':
+
+                            value = CreatedAt.from_timestamp(value)
+
+                        setattr(
+                            gql_language,
+                            attribute,
+                            value)
+
+                    gql_language_list.append(gql_language)
+
+            else:
+
+                # We are getting attribute values as they are.
+
+                for result in result_list:
+
+                    language_id = (
+                        result.client_id, result.object_id)
+
+                    # Getting dictionary docunt if required, recursive or not, filtering based on it if
+                    # required. 
+
+                    if total_count_flag:
+
+                        dictionary_count = f(language_id)
+
+                    elif dictionary_count_flag:
+
+                        dictionary_count = result.dictionary_count
+
+                    if (only_with_dictionaries_recursive and
+                        dictionary_count <= 0):
+
+                        continue
+
+                    gql_language = (
+                        Language(id = language_id))
+
+                    if in_toc_flag:
+
+                        metadata = (
+                            result.additional_metadata)
+
+                        gql_language.in_toc = (
+                            language_id in utils.standard_language_id_set or
+                            metadata and metadata.get('toc_mark'))
+
+                        gql_language.additional_metadata = metadata
+
+                    if dictionary_count_flag:
+
+                        gql_language.dictionary_count = dictionary_count
+                        selection_field_set.discard('dictionary_count')
+
+                    for selection in selection_field_set:
+
+                        if selection == 'id':
+
+                            gql_language.id = language_id
+
+                            continue
+
+                        elif selection == 'parent_id':
+
+                            gql_language.parent_id = (
+                                result.parent_client_id,
+                                result.parent_object_id)
+
+                            continue
+
+                        value = getattr(result, selection)
+
+                        if selection == 'created_at':
+
+                            value = CreatedAt.from_timestamp(value)
+
+                        setattr(
+                            gql_language,
+                            selection,
+                            value)
+
+                    gql_language_list.append(gql_language)
+
+            return gql_language_list
+
+            raise NotImplementedError
+
+
+
+            context = info.context
+
+            if id_list is None:
+              languages = DBSession.query(dbLanguage).filter_by(marked_for_deletion = False).all()
+
+            # We are requested to get a set of languages specified by ids.
+
+            else:
+              languages_all = DBSession.query(dbLanguage).filter(
+                tuple_(dbLanguage.client_id, dbLanguage.object_id).in_(id_list)).all()
+
+              language_id_set = set(
+                tuple(id) for id in id_list)
+
+              languages = []
+              deleted_id_list = []
+
+              # Checking which ids do not correspond to languages, and which are of deleted languages.
+
+              for language in languages_all:
+
+                language_id = (language.client_id, language.object_id)
+                language_id_set.remove(language_id)
+
+                if language.marked_for_deletion:
+                  deleted_id_list.append(language_id)
+
+                else:
+                  languages.append(language)
+
+              # Showing gathered info.
+
+              log.debug(
+                '\nlanguages:'
+                '\n{0} ids:\n{1}'
+                '\n{2} missed:\n{3}'
+                '\n{4} deleted:\n{5}'.format(
+                len(id_list),
+                pprint.pformat(id_list, width = 108),
+                len(language_id_set),
+                pprint.pformat(sorted(language_id_set), width = 108),
+                len(deleted_id_list),
+                pprint.pformat(deleted_id_list, width = 108)))
+
+            languages_list = list()
+            for db_lang in languages:
+                gql_lang = Language(id=[db_lang.client_id, db_lang.object_id])
+                gql_lang.dbObject = db_lang
+                languages_list.append(gql_lang)
+
+            return languages_list
+
+        except Exception as exception:
+
+            traceback_string = (
+
+                ''.join(
+                    traceback.format_exception(
+                        exception, exception, exception.__traceback__))[:-1])
+
+            log.warning('languages: exception')
+            log.warning(traceback_string)
+
+            return (
+                ResponseError(
+                    'Exception:\n' + traceback_string))
 
     def resolve_entity(self, info, id):
         return Entity(id=id)
@@ -2127,19 +5380,493 @@ class Query(graphene.ObjectType):
     def resolve_organization(self, info, id):
         return Organization(id=id)
 
-    def resolve_organizations(self, info):
+    def resolve_organizations(
+        self,
+        info,
+        has_participant = None,
+        participant_deleted = None,
+        participant_published = None,
+        participant_category = None):
 
-        organizations = DBSession.query(dbOrganization).filter_by(marked_for_deletion=False).all()
-        organizations_list = list()
+        __debug_flag__ = False
 
-        for db_organization in organizations:
+        # Analyzing query.
 
-            gql_organization = Organization(id=db_organization.id)
-            gql_organization.dbObject = db_organization
+        object_flag = False
 
-            organizations_list.append(gql_organization)
+        selection_dict = {
 
-        return organizations_list
+            'created_at': (
+                dbOrganization.created_at,),
+
+            'id': (
+                dbOrganization.id,),
+
+            'marked_for_deletion': (
+                dbOrganization.marked_for_deletion,),
+
+            'about_translations': (
+                dbOrganization.about_translation_gist_client_id,
+                dbOrganization.about_translation_gist_object_id),
+
+            'translations': (
+                dbOrganization.translation_gist_client_id,
+                dbOrganization.translation_gist_object_id)}
+
+        selection_set = set()
+        selection_list = []
+
+        for field in info.field_asts:
+
+            if field.name.value != 'organizations':
+                continue
+
+            for subfield in field.selection_set.selections:
+
+                name_str = subfield.name.value
+
+                if name_str in selection_dict:
+
+                    selection_set.add(name_str)
+                    selection_list.extend(selection_dict[name_str])
+
+                elif name_str != '__typename':
+
+                    object_flag = True
+
+        if object_flag:
+
+            selection_list = [dbOrganization]
+
+        elif 'id' not in selection_set:
+
+            # For standard organization ordering.
+
+            selection_set.add('id')
+            selection_list.extend(selection_dict['id'])
+
+        # If we are going to query both the usual and about translations, we'll have to use separate joins
+        # to a CTE-based queries to avoid joining to actually a cross product of two translations.
+
+        translations_flag = 'translations' in selection_set
+        about_translations_flag = 'about_translations' in selection_set
+
+        cte_flag = (
+            translations_flag and
+            about_translations_flag)
+
+        organization_cte = None
+        organization_query = None
+
+        # Participant filtering, if required.
+
+        if has_participant is not None:
+
+            if (participant_deleted is not None or
+                participant_category is not None or
+                participant_published is not None):
+
+                # Additional conditions on participants, we'll have to check them through a join.
+
+                dictionary_condition_list = []
+
+                if participant_deleted is not None:
+
+                    dictionary_condition_list.append(
+                        '\n and D.marked_for_deletion = true' if participant_deleted else
+                        '\n and D.marked_for_deletion = false')
+
+                if participant_category is not None:
+
+                    dictionary_condition_list.append(
+                        f'\n and D.category = {participant_category}')
+
+                if participant_published is not None:
+
+                    if not participant_published:
+                        raise NotImplementedError
+
+                    dictionary_condition_list.append(f'''
+
+                        and (
+                          D.state_translation_gist_client_id,
+                          D.state_translation_gist_object_id) in (
+
+                          select
+                            T.client_id,
+                            T.object_id
+
+                          from
+                            translationgist T,
+                            translationatom A
+
+                          where
+                            T.marked_for_deletion = false and
+                            T.type = 'Service' and
+                            A.parent_client_id = T.client_id and
+                            A.parent_object_id = T.object_id and
+                            A.locale_id = 2 and
+                            A.marked_for_deletion = false and (
+                              A.content = 'Published' or
+                              A.content = 'Limited access'))
+
+                        ''')
+
+                dictionary_condition_str = (
+                    ''.join(dictionary_condition_list))
+
+                if object_flag:
+
+                    selection_str = 'O.*'
+
+                else:
+
+                    selection_str = (
+
+                        ', '.join(
+                            f'O.{selection.name}'
+                            for selection in selection_list))
+
+                sql_text = (
+
+                    sqlalchemy.text(f'''
+
+                        select
+                          {selection_str}
+
+                        from
+                          organization O
+
+                        cross join
+                          jsonb_to_recordset(O.additional_metadata -> 'participant')
+                            P (client_id bigint, object_id bigint)
+
+                        join
+                          dictionary D
+
+                        on
+                          D.client_id = P.client_id and
+                          D.object_id = P.object_id {dictionary_condition_str}
+
+                        where
+                          O.marked_for_deletion = false
+
+                        group by
+                          O.id
+
+                        '''))
+
+                if object_flag:
+
+                    sql_text = (
+
+                        aliased(
+                            dbOrganization,
+
+                            sql_text
+
+                                .columns(
+                                    **{column.name: column.type
+                                        for column in dbOrganization.__table__.c})
+
+                                .alias(),
+
+                            adapt_on_names = True))
+
+                else:
+
+                    sql_text = (
+
+                        sql_text
+
+                            .columns(
+                                *selection_list)
+
+                            .alias())
+
+                organization_query = (
+                    DBSession.query(sql_text))
+
+                organization_c = (
+                    sql_text.c)
+
+                if not has_participant:
+                    raise NotImplementedError
+
+            else:
+
+                # Simple participant count filter.
+
+                participant_count = (
+
+                    func.jsonb_array_length(
+                        dbOrganization.additional_metadata['participant']))
+
+                organization_query = (
+
+                    DBSession
+
+                        .query(
+                            *selection_list)
+
+                        .filter(
+                            dbOrganization.marked_for_deletion == False,
+
+                            participant_count > 0 if has_participant else
+                            participant_count <= 0))
+
+                organization_c = dbOrganization
+
+        # Establishing a CTE if we'll need it.
+
+        if cte_flag:
+
+            organization_cte = organization_query.cte()
+            organization_c = organization_cte.c
+
+            if object_flag:
+
+                organization_cte = (
+
+                    aliased(
+                        dbOrganization,
+                        organization_cte,
+                        adapt_on_names = True))
+
+                organization_c = organization_cte
+
+            organization_query = (
+                DBSession.query(organization_cte))
+
+        # Getting translations through a join, if required.
+
+        if translations_flag:
+
+            if organization_cte is not None:
+
+                translation_query = (
+
+                    DBSession
+
+                        .query(
+                            organization_c.id)
+
+                        .outerjoin(
+                            dbTranslationAtom,
+
+                            and_(
+                                dbTranslationAtom.parent_client_id == organization_c.translation_gist_client_id,
+                                dbTranslationAtom.parent_object_id == organization_c.translation_gist_object_id,
+                                dbTranslationAtom.marked_for_deletion == False))
+
+                        .add_columns(
+
+                            func.jsonb_object_agg(
+                                dbTranslationAtom.locale_id,
+                                dbTranslationAtom.content)
+
+                                .filter(dbTranslationAtom.locale_id != None)
+                                .label('translations'))
+
+                        .group_by(
+                            organization_c.id)
+
+                        .subquery())
+
+                organization_query = (
+
+                    organization_query
+
+                        .join(
+                            translation_query,
+                            translation_query.c.id == organization_c.id)
+
+                        .add_columns(
+                            translation_query.c.translations))
+
+            else:
+
+                organization_query = (
+
+                    organization_query
+
+                        .outerjoin(
+                            dbTranslationAtom,
+
+                            and_(
+                                dbTranslationAtom.parent_client_id == organization_c.translation_gist_client_id,
+                                dbTranslationAtom.parent_object_id == organization_c.translation_gist_object_id,
+                                dbTranslationAtom.marked_for_deletion == False))
+
+                        .add_columns(
+
+                            func.jsonb_object_agg(
+                                dbTranslationAtom.locale_id,
+                                dbTranslationAtom.content)
+
+                                .filter(dbTranslationAtom.locale_id != None)
+                                .label('translations'))
+
+                        .group_by(
+                            *organization_c))
+
+        # Getting about translations through a join, if required.
+
+        if about_translations_flag:
+
+            if organization_cte is not None:
+
+                about_translation_query = (
+
+                    DBSession
+
+                        .query(
+                            organization_c.id)
+
+                        .outerjoin(
+                            dbTranslationAtom,
+
+                            and_(
+                                dbTranslationAtom.parent_client_id == organization_c.about_translation_gist_client_id,
+                                dbTranslationAtom.parent_object_id == organization_c.about_translation_gist_object_id,
+                                dbTranslationAtom.marked_for_deletion == False))
+
+                        .add_columns(
+
+                            func.jsonb_object_agg(
+                                dbTranslationAtom.locale_id,
+                                dbTranslationAtom.content)
+
+                                .filter(dbTranslationAtom.locale_id != None)
+                                .label('about_translations'))
+
+                        .group_by(
+                            organization_c.id)
+
+                        .subquery())
+
+                organization_query = (
+
+                    organization_query
+
+                        .join(
+                            about_translation_query,
+                            about_translation_query.c.id == organization_c.id)
+
+                        .add_columns(
+                            about_translation_query.c.about_translations))
+
+            else:
+
+                organization_query = (
+
+                    organization_query
+
+                        .outerjoin(
+                            dbTranslationAtom,
+
+                            and_(
+                                dbTranslationAtom.parent_client_id == organization_c.about_translation_gist_client_id,
+                                dbTranslationAtom.parent_object_id == organization_c.about_translation_gist_object_id,
+                                dbTranslationAtom.marked_for_deletion == False))
+
+                        .add_columns(
+
+                            func.jsonb_object_agg(
+                                dbTranslationAtom.locale_id,
+                                dbTranslationAtom.content)
+
+                                .filter(dbTranslationAtom.locale_id != None)
+                                .label('about_translations'))
+
+                        .group_by(
+                            organization_c.id))
+
+        # Getting organization info, preparing it for GraphQL.
+
+        organization_query = (
+
+            organization_query
+                .order_by(organization_c.id))
+
+        result_list = organization_query.all()
+
+        if __debug_flag__:
+
+            log.debug(
+                '\norganization_query:\n' +
+                render_statement(organization_query.statement))
+
+        gql_organization_list = []
+
+        if object_flag:
+
+            # We are getting full ORM dbOrganization objects.
+
+            attribute_set = selection_set.copy()
+
+            attribute_set.discard('translations')
+            attribute_set.discard('about_translations')
+
+            for result in result_list:
+
+                organization = (
+                    result[0] if translations_flag or about_translations_flag else
+                    result)
+
+                gql_organization = (
+                    Organization(id = organization.id))
+
+                gql_organization.dbObject = organization
+
+                if translations_flag:
+
+                    gql_organization.translations = result.translations
+
+                if about_translations_flag:
+
+                    gql_organization.about_translations = result.about_translations
+
+                for attribute in attribute_set:
+
+                    value = getattr(organization, attribute)
+
+                    if attribute == 'created_at':
+
+                        value = CreatedAt.from_timestamp(value)
+
+                    setattr(
+                        gql_organization,
+                        attribute,
+                        value)
+
+                gql_organization_list.append(gql_organization)
+
+        else:
+
+            # We are getting attribute values as they are.
+
+            for result in result_list:
+
+                gql_organization = (
+                    Organization(id = result.id))
+
+                for selection in selection_set:
+
+                    value = getattr(result, selection)
+
+                    if selection == 'created_at':
+
+                        value = CreatedAt.from_timestamp(value)
+
+                    setattr(
+                        gql_organization,
+                        selection,
+                        value)
+
+                gql_organization_list.append(gql_organization)
+
+        return gql_organization_list
 
     # def resolve_passhash(self, args, context, info):
     #     id = args.get('id')
@@ -2209,6 +5936,18 @@ class Query(graphene.ObjectType):
         atoms_flag = False
         atoms_deleted = None
 
+        def f(argument):
+
+            try:
+
+                return argument.value.value
+
+            except AttributeError:
+
+                return (
+                    info.variable_values.get(
+                        argument.value.name.value, None))
+
         for field in info.field_asts:
 
             if field.name.value != 'translation_search':
@@ -2220,18 +5959,6 @@ class Query(graphene.ObjectType):
                     continue
 
                 atoms_flag = True
-
-                def f(argument):
-
-                    try:
-
-                        return argument.value.value
-
-                    except AttributeError:
-
-                        return (
-                            info.variable_values.get(
-                                argument.value.name.value, None))
 
                 for argument in subfield.arguments:
 
@@ -2291,7 +6018,7 @@ class Query(graphene.ObjectType):
                 gist_query.filter(
 
                     tuple_(
-                        dbTranslationGist.client_id, 
+                        dbTranslationGist.client_id,
                         dbTranslationGist.object_id)
 
                         .in_(gist_id_query)))
@@ -2471,12 +6198,12 @@ class Query(graphene.ObjectType):
                 .insert()
                 .values(insert_list))
 
-        if debug_flag:        
+        if debug_flag:
 
             log.debug(
                 '\ninsert_query:\n' +
                 str(insert_query.compile(compile_kwargs = {'literal_binds': True})))
-        
+
         DBSession.execute(insert_query)
 
         gist_query = (
@@ -2504,7 +6231,7 @@ class Query(graphene.ObjectType):
                     dbTranslationGist.client_id,
                     dbTranslationGist.object_id))
 
-        if debug_flag:        
+        if debug_flag:
 
             log.debug(
                 '\ngist_query:\n' +
@@ -3071,7 +6798,13 @@ class Query(graphene.ObjectType):
     def resolve_grant(self, info, id):
         return Grant(id=id)
 
-    def resolve_grants(self, info):
+    def resolve_grants(
+        self,
+        info,
+        has_participant = None,
+        participant_deleted = None,
+        participant_published = None,
+        participant_category = None):
         """
         query myQuery {
           grants {
@@ -3079,14 +6812,502 @@ class Query(graphene.ObjectType):
            }
         }
         """
-        grants = DBSession.query(dbGrant).order_by(dbGrant.grant_number).all()
-        grants_list = list()
-        for dbgrant in grants:
-            grant =  Grant(id=dbgrant.id)
-            grant.dbObject = dbgrant
-            grants_list.append(grant)
 
-        return grants_list
+        __debug_flag__ = False
+
+        # Analyzing query.
+
+        object_flag = False
+
+        selection_dict = {
+
+            'begin': (
+                dbGrant.begin,),
+
+            'created_at': (
+                dbGrant.created_at,),
+
+            'end': (
+                dbGrant.end,),
+
+            'grant_number': (
+                dbGrant.grant_number,),
+
+            'grant_url': (
+                dbGrant.grant_url,),
+
+            'id': (
+                dbGrant.id,),
+
+            'issuer_translations': (
+                dbGrant.issuer_translation_gist_client_id,
+                dbGrant.issuer_translation_gist_object_id),
+
+            'issuer_url': (
+                dbGrant.issuer_url,),
+
+            'translations': (
+                dbGrant.translation_gist_client_id,
+                dbGrant.translation_gist_object_id)}
+
+        selection_set = set()
+        selection_list = []
+
+        for field in info.field_asts:
+
+            if field.name.value != 'grants':
+                continue
+
+            for subfield in field.selection_set.selections:
+
+                name_str = subfield.name.value
+
+                if name_str in selection_dict:
+
+                    selection_set.add(name_str)
+                    selection_list.extend(selection_dict[name_str])
+
+                elif name_str != '__typename':
+
+                    object_flag = True
+
+        if object_flag:
+
+            selection_list = [dbGrant]
+
+        elif 'grant_number' not in selection_set:
+
+            # For standard grant ordering.
+
+            selection_set.add('grant_number')
+            selection_list.extend(selection_dict['grant_number'])
+
+        # If we are going to query both the usual and issuer translations, we'll have to use separate joins
+        # to a CTE-based queries to avoid joining to actually a cross product of two translations.
+
+        translations_flag = 'translations' in selection_set
+        issuer_translations_flag = 'issuer_translations' in selection_set
+
+        cte_flag = (
+            translations_flag and
+            issuer_translations_flag)
+
+        grant_cte = None
+        grant_query = None
+
+        # Participant filtering, if required.
+
+        if has_participant is not None:
+
+            if (participant_deleted is not None or
+                participant_category is not None or
+                participant_published is not None):
+
+                # Additional conditions on participants, we'll have to check them through a join.
+
+                dictionary_condition_list = []
+
+                if participant_deleted is not None:
+
+                    dictionary_condition_list.append(
+                        '\n and D.marked_for_deletion = true' if participant_deleted else
+                        '\n and D.marked_for_deletion = false')
+
+                if participant_category is not None:
+
+                    dictionary_condition_list.append(
+                        f'\n and D.category = {participant_category}')
+
+                if participant_published is not None:
+
+                    if not participant_published:
+                        raise NotImplementedError
+
+                    dictionary_condition_list.append(f'''
+
+                        and (
+                          D.state_translation_gist_client_id,
+                          D.state_translation_gist_object_id) in (
+
+                          select
+                            T.client_id,
+                            T.object_id
+
+                          from
+                            translationgist T,
+                            translationatom A
+
+                          where
+                            T.marked_for_deletion = false and
+                            T.type = 'Service' and
+                            A.parent_client_id = T.client_id and
+                            A.parent_object_id = T.object_id and
+                            A.locale_id = 2 and
+                            A.marked_for_deletion = false and (
+                              A.content = 'Published' or
+                              A.content = 'Limited access'))
+
+                        ''')
+
+                dictionary_condition_str = (
+                    ''.join(dictionary_condition_list))
+
+                if object_flag:
+
+                    selection_str = 'G.*'
+
+                else:
+
+                    selection_str = (
+
+                        ', '.join(
+                            f'G.{selection.name}'
+                            for selection in selection_list))
+
+                sql_text = (
+
+                    sqlalchemy.text(f'''
+
+                        select
+                          {selection_str}
+
+                        from
+                          public.grant G
+
+                        cross join
+                          jsonb_to_recordset(G.additional_metadata -> 'participant')
+                            P (client_id bigint, object_id bigint)
+
+                        join
+                          dictionary D
+
+                        on
+                          D.client_id = P.client_id and
+                          D.object_id = P.object_id {dictionary_condition_str}
+
+                        group by
+                          G.id
+
+                        '''))
+
+                if object_flag:
+
+                    sql_text = (
+
+                        aliased(
+                            dbGrant,
+
+                            sql_text
+
+                                .columns(
+                                    **{column.name: column.type
+                                        for column in dbGrant.__table__.c})
+
+                                .alias(),
+
+                            adapt_on_names = True))
+
+                else:
+
+                    sql_text = (
+
+                        sql_text
+
+                            .columns(
+                                *selection_list)
+
+                            .alias())
+
+                grant_query = (
+                    DBSession.query(sql_text))
+
+                grant_c = (
+                    sql_text)
+
+                if not has_participant:
+
+                    raise NotImplementedError
+
+            else:
+
+                # Simple participant count filter.
+
+                participant_count = (
+
+                    func.jsonb_array_length(
+                        dbGrant.additional_metadata['participant']))
+
+                grant_query = (
+
+                    DBSession
+
+                        .query(
+                            *selection_list)
+
+                        .filter(
+                            participant_count > 0 if has_participant else
+                            participant_count <= 0))
+
+                grant_c = dbGrant
+
+        # Establishing a CTE if we'll need it.
+
+        if cte_flag:
+
+            grant_cte = grant_query.cte()
+            grant_c = grant_cte.c
+
+            if object_flag:
+
+                grant_cte = (
+
+                    aliased(
+                        dbGrant,
+                        grant_cte,
+                        adapt_on_names = True))
+
+                grant_c = grant_cte
+
+            grant_query = (
+                DBSession.query(grant_cte))
+
+        # Getting translations through a join, if required.
+
+        if translations_flag:
+
+            if grant_cte is not None:
+
+                translation_query = (
+
+                    DBSession
+
+                        .query(
+                            grant_c.id)
+
+                        .outerjoin(
+                            dbTranslationAtom,
+
+                            and_(
+                                dbTranslationAtom.parent_client_id == grant_c.translation_gist_client_id,
+                                dbTranslationAtom.parent_object_id == grant_c.translation_gist_object_id,
+                                dbTranslationAtom.marked_for_deletion == False))
+
+                        .add_columns(
+
+                            func.jsonb_object_agg(
+                                dbTranslationAtom.locale_id,
+                                dbTranslationAtom.content)
+
+                                .filter(dbTranslationAtom.locale_id != None)
+                                .label('translations'))
+
+                        .group_by(
+                            grant_c.id)
+
+                        .subquery())
+
+                grant_query = (
+
+                    grant_query
+
+                        .join(
+                            translation_query,
+                            translation_query.c.id == grant_c.id)
+
+                        .add_columns(
+                            translation_query.c.translations))
+
+            else:
+
+                grant_query = (
+
+                    grant_query
+
+                        .outerjoin(
+                            dbTranslationAtom,
+
+                            and_(
+                                dbTranslationAtom.parent_client_id == grant_c.translation_gist_client_id,
+                                dbTranslationAtom.parent_object_id == grant_c.translation_gist_object_id,
+                                dbTranslationAtom.marked_for_deletion == False))
+
+                        .add_columns(
+
+                            func.jsonb_object_agg(
+                                dbTranslationAtom.locale_id,
+                                dbTranslationAtom.content)
+
+                                .filter(dbTranslationAtom.locale_id != None)
+                                .label('translations'))
+
+                        .group_by(
+                            grant_c.id))
+
+        # Getting issuer translations through a join, if required.
+
+        if issuer_translations_flag:
+
+            if grant_cte is not None:
+
+                issuer_translation_query = (
+
+                    DBSession
+
+                        .query(
+                            grant_c.id)
+
+                        .outerjoin(
+                            dbTranslationAtom,
+
+                            and_(
+                                dbTranslationAtom.parent_client_id == grant_c.issuer_translation_gist_client_id,
+                                dbTranslationAtom.parent_object_id == grant_c.issuer_translation_gist_object_id,
+                                dbTranslationAtom.marked_for_deletion == False))
+
+                        .add_columns(
+
+                            func.jsonb_object_agg(
+                                dbTranslationAtom.locale_id,
+                                dbTranslationAtom.content)
+
+                                .filter(dbTranslationAtom.locale_id != None)
+                                .label('issuer_translations'))
+
+                        .group_by(
+                            grant_c.id)
+
+                        .subquery())
+
+                grant_query = (
+
+                    grant_query
+
+                        .join(
+                            issuer_translation_query,
+                            issuer_translation_query.c.id == grant_c.id)
+
+                        .add_columns(
+                            issuer_translation_query.c.issuer_translations))
+
+            else:
+
+                grant_query = (
+
+                    grant_query
+
+                        .outerjoin(
+                            dbTranslationAtom,
+
+                            and_(
+                                dbTranslationAtom.parent_client_id == grant_c.issuer_translation_gist_client_id,
+                                dbTranslationAtom.parent_object_id == grant_c.issuer_translation_gist_object_id,
+                                dbTranslationAtom.marked_for_deletion == False))
+
+                        .add_columns(
+
+                            func.jsonb_object_agg(
+                                dbTranslationAtom.locale_id,
+                                dbTranslationAtom.content)
+
+                                .filter(dbTranslationAtom.locale_id != None)
+                                .label('issuer_translations'))
+
+                        .group_by(
+                            grant_c.id))
+
+        # Getting grant info, preparing it for GraphQL.
+
+        grant_query = (
+
+            grant_query
+                .order_by(grant_c.grant_number))
+
+        result_list = grant_query.all()
+
+        if __debug_flag__:
+
+            log.debug(
+                '\ngrant_query:\n' +
+                render_statement(grant_query.statement))
+
+        gql_grant_list = []
+
+        if object_flag:
+
+            # We are getting full ORM dbGrant objects.
+
+            attribute_set = selection_set.copy()
+
+            attribute_set.discard('translations')
+            attribute_set.discard('issuer_translations')
+
+            for result in result_list:
+
+                grant = (
+                    result[0] if translations_flag or issuer_translations_flag else
+                    result)
+
+                gql_grant = (
+                    Grant(id = grant.id))
+
+                gql_grant.dbObject = grant
+
+                if translations_flag:
+
+                    gql_grant.translations = result.translations
+
+                if issuer_translations_flag:
+
+                    gql_grant.issuer_translations = result.issuer_translations
+
+                for attribute in attribute_set:
+
+                    value = getattr(grant, attribute)
+
+                    if attribute == 'begin' or attribute == 'end':
+
+                        value = Grant.from_date(value)
+
+                    elif attribute == 'created_at':
+
+                        value = CreatedAt.from_timestamp(value)
+
+                    setattr(
+                        gql_grant,
+                        attribute,
+                        value)
+
+                gql_grant_list.append(gql_grant)
+
+        else:
+
+            # We are getting attribute values as they are.
+
+            for result in result_list:
+
+                gql_grant = (
+                    Grant(id = result.id))
+
+                for selection in selection_set:
+
+                    value = getattr(result, selection)
+
+                    if selection == 'begin' or selection == 'end':
+
+                        value = Grant.from_date(value)
+
+                    elif selection == 'created_at':
+
+                        value = CreatedAt.from_timestamp(value)
+
+                    setattr(
+                        gql_grant,
+                        selection,
+                        value)
+
+                gql_grant_list.append(gql_grant)
+
+        return gql_grant_list
 
     def resolve_phonology_tier_list(self, info, perspective_id):
         """
@@ -10308,7 +14529,7 @@ class Docx2Eaf(graphene.Mutation):
                 bucket = storage_temporary['bucket']
 
                 minio_client = (
-                        
+
                     minio.Minio(
                         host,
                         access_key = storage_temporary['access_key'],
@@ -10338,7 +14559,7 @@ class Docx2Eaf(graphene.Mutation):
                     object_name = (
 
                         storage_temporary['prefix'] +
-                    
+
                         '/'.join((
                             'docx2eaf',
                             '{:.6f}'.format(current_time),
@@ -10674,7 +14895,7 @@ class Valency(graphene.Mutation):
         bucket = storage_temporary['bucket']
 
         minio_client = (
-                
+
             minio.Minio(
                 host,
                 access_key = storage_temporary['access_key'],
@@ -10698,7 +14919,7 @@ class Valency(graphene.Mutation):
                     indent = 2))
 
             temporary_file = (
-                    
+
                 tempfile.NamedTemporaryFile(
                     delete = False))
 
@@ -10729,7 +14950,7 @@ class Valency(graphene.Mutation):
             object_name = (
 
                 storage_temporary['prefix'] +
-            
+
                 '/'.join((
                     'valency',
                     '{:.6f}'.format(current_time),
@@ -11419,7 +15640,7 @@ class CreateValencyData(graphene.Mutation):
                             'index': index,
                             'location': (ind, r),
                             'case': cs})
-                        
+
                         data_case_set.add(cs)
 
                     sentence_data = {
@@ -11461,7 +15682,7 @@ class CreateValencyData(graphene.Mutation):
         # Getting ELAN corpus data, processing each ELAN file.
 
         entity_list = (
-        
+
             DBSession
 
                 .query(

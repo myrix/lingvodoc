@@ -19,7 +19,7 @@ from sqlalchemy.sql import column
 from sqlalchemy.sql.expression import Executable, ClauseElement, _literal_as_text, FromClause
 
 
-from lingvodoc.models import DBSession, SLBigInteger
+from lingvodoc.models import DBSession, ObjectTOC, SLBigInteger
 
 
 class explain(Executable, ClauseElement):
@@ -221,6 +221,14 @@ def ids_to_id_query(ids, explicit_cast = False):
         DBSession.query(
             c_client_id, c_object_id))
 
+def ids_to_id_cte(ids):
+
+    return ids_to_id_query(ids).cte()
+
+def ids_to_id_cte_query(ids):
+
+    return DBSession.query(ids_to_id_cte(ids))
+
 
 def render_statement(statement):
     """
@@ -230,7 +238,10 @@ def render_statement(statement):
     Based on, among other things, on https://stackoverflow.com/a/9898141/2016856.
     """
 
-    dialect = statement.bind.dialect
+    dialect = (
+        statement.bind.dialect if statement.bind else
+        DBSession.query(ObjectTOC).statement.bind.dialect)
+
     compiler = statement._compiler(dialect)
 
     class Compiler(type(compiler)):

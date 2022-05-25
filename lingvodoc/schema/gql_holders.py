@@ -12,7 +12,7 @@ from graphene.types import Scalar
 from graphene.types.json import JSONString as JSONtype
 from graphene.types.generic import GenericScalar
 
-from sqlalchemy import tuple_
+from sqlalchemy import or_, tuple_
 
 from lingvodoc.models import (
     ObjectTOC,
@@ -649,15 +649,17 @@ class CompositeIdHolder(graphene.Interface):
 class CreatedAt(graphene.Interface):
     created_at = graphene.Float() #DateTime()
 
+    @staticmethod
+    def from_timestamp(value):
+
+        if isinstance(value, (int, float)):
+            return value
+
+        return value.replace(tzinfo = datetime.timezone.utc).timestamp()
+
     @fetch_object("created_at")
     def resolve_created_at(self, info):
-
-        created_at = self.dbObject.created_at
-
-        if isinstance(created_at, (int, float)):
-            return created_at
-
-        return created_at.replace(tzinfo = datetime.timezone.utc).timestamp()
+        CreatedAt.from_timestamp(self.dbObject.created_at)
 
 
 class DeletedAt(graphene.Interface):
@@ -823,14 +825,16 @@ class TranslationHolder(graphene.Interface):
 
     @fetch_object("translation")
     def resolve_translation(self, info, locale_id = None):
-        if self.dbObject:
-            return str(self.dbObject.get_translation( # TODO: fix it
+
+        return (
+            self.dbObject.get_translation( # TODO: fix it
                 locale_id if locale_id is not None else info.context.get('locale_id')))
 
     @fetch_object("translations")
     def resolve_translations(self, info):
-        if self.dbObject:
-            return self.dbObject.get_translations()
+
+        return (
+            self.dbObject.get_translations())
 
 
 # rare interfaces
@@ -1029,7 +1033,7 @@ class AdditionalMetadata(graphene.Interface):
 
     additional_metadata = graphene.Field(Metadata)
 
-    @fetch_object()
+    @fetch_object("additional_metadata")
     def resolve_additional_metadata(self, info):
         db_object = self.dbObject
 
@@ -1127,3 +1131,59 @@ class UnstructuredData(LingvodocObjectType):
     @fetch_object('additional_metadata')
     def resolve_additional_metadata(self, info):
         return self.dbObject.additional_metadata
+
+
+def get_published_translation_gist_id_query(session = DBSession):
+
+    return (
+
+        session
+
+            .query(
+                dbTranslationGist.client_id,
+                dbTranslationGist.object_id)
+
+            .filter(
+                dbTranslationGist.marked_for_deletion == False,
+                dbTranslationGist.type == 'Service',
+                dbTranslationAtom.parent_client_id == dbTranslationGist.client_id,
+                dbTranslationAtom.parent_object_id == dbTranslationGist.object_id,
+                dbTranslationAtom.locale_id == 2,
+                dbTranslationAtom.marked_for_deletion == False,
+
+                or_(
+                    dbTranslationAtom.content == 'Published',
+                    dbTranslationAtom.content == 'Limited access')))
+
+
+published_translation_gist_id_query = (
+    get_published_translation_gist_id_query())
+
+
+def get_published_translation_gist_id_cte(query = None, session = DBSession):
+
+    if query is None:
+        query = get_published_translation_gist_id_query(session)
+
+    return query.cte()
+
+
+published_translation_gist_id_cte = (
+
+    get_published_translation_gist_id_cte(
+        published_translation_gist_id_query))
+
+
+def get_published_translation_gist_id_cte_query(cte = None, session = DBSession):
+
+    if cte is None:
+        cte = get_published_translation_gist_id_cte(session)
+
+    return session.query(cte)
+
+
+published_translation_gist_id_cte_query = (
+
+    get_published_translation_gist_id_cte_query(
+        published_translation_gist_id_cte))
+
