@@ -1384,6 +1384,17 @@ class AdvancedSearch(LingvodocObjectType):
                     dictionaries.filter(
                         dbDictionary.additional_metadata['tag_list'].contains(tag_list)))
 
+            # __DEBUG__
+
+            DBSession.execute('''
+                LOAD 'auto_explain';
+                SET auto_explain.log_min_duration = 0;
+                SET auto_explain.log_nested_statements = ON;
+                SET auto_explain.log_analyze = true;
+            ''')
+
+            # __
+
             if search_metadata:
 
                 has_audio = (
@@ -1577,6 +1588,10 @@ class AdvancedSearch(LingvodocObjectType):
                             dbDictionary.object_id == dictionary_id_table.c.object_id)
 
                         .all())
+
+                # __DEBUG__
+
+                raise NotImplementedError
 
                 gql_dictionary_list = [
                     graphene_obj(dictionary, Dictionary)

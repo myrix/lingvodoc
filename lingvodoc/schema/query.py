@@ -228,19 +228,21 @@ from lingvodoc.utils.proxy import try_proxy, ProxyPass
 import sqlalchemy
 
 from sqlalchemy import (
-    func,
     and_,
+    Boolean,
+    case,
+    cast,
+    create_engine,
+    func,
+    literal,
     or_,
     tuple_,
-    create_engine,
-    literal,
     union,
-    cast,
-    Boolean,
 )
 
 import sqlalchemy.dialects.postgresql as postgresql
 
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.sql.elements import ColumnElement
 
 import sqlalchemy.types
@@ -4914,8 +4916,15 @@ class Query(graphene.ObjectType):
                     order_by_list.append(
                         func.coalesce(accept_subquery.c.accept_value, False) != accept_value)
 
-        order_by_list.append(
-            dbValencyInstanceData.id)
+        # Ensuring that at the base, instances go in the order of their position in the source document.
+        #
+        # Can't use instance ids for that as updates may mix things up; on the other hand, order of
+        # sentences in the document is expected to corresponds to the order of their ids, and instances are
+        # ordered inside their sentences by their index.
+
+        order_by_list.extend((
+            dbValencyInstanceData.sentence_id,
+            dbValencyInstanceData.index))
 
         # Getting annotation instances and related info.
 
@@ -15613,6 +15622,12 @@ class Valency(graphene.Mutation):
       --data-raw '{"operationName":"valency","variables":{"perspectiveId":[3648,8]},"query":"mutation valency($perspectiveId: LingvodocID!) { valency(perspective_id: $perspectiveId, synchronous: true, debug_flag: true) { triumph }}"}'
     """
 
+    version_timestamp = (
+
+        datetime
+            .datetime(2023, 3, 29, tzinfo = datetime.timezone.utc)
+            .timestamp())
+
     class Arguments:
 
         perspective_id = LingvodocID(required = True)
@@ -15625,29 +15640,46 @@ class Valency(graphene.Mutation):
     @staticmethod
     def get_parser_result_data(
         perspective_id,
-        debug_flag):
+        only_updateable_flag = False,
+        also_deleted_flag = False,
+        debug_flag = False):
 
         entry_dict = collections.defaultdict(dict)
         entry_list = []
 
-        entity_list = (
+        # Filterting out deleted unless explicitly asked not to.
+
+        entity_query = (
 
             DBSession
 
                 .query(
-                    dbEntity)
+                    dbEntity,
+                    dbLexicalEntry.marked_for_deletion)
 
                 .filter(
                     dbLexicalEntry.parent_client_id == perspective_id[0],
                     dbLexicalEntry.parent_object_id == perspective_id[1],
-                    dbLexicalEntry.marked_for_deletion == False,
                     dbEntity.parent_client_id == dbLexicalEntry.client_id,
                     dbEntity.parent_object_id == dbLexicalEntry.object_id,
-                    dbEntity.marked_for_deletion == False,
                     dbPublishingEntity.client_id == dbEntity.client_id,
                     dbPublishingEntity.object_id == dbEntity.object_id,
                     dbPublishingEntity.published == True,
-                    dbPublishingEntity.accepted == True)
+                    dbPublishingEntity.accepted == True))
+
+        if not also_deleted_flag:
+
+            entity_query = (
+
+                entity_query
+
+                    .filter(
+                        dbLexicalEntry.marked_for_deletion == False,
+                        dbEntity.marked_for_deletion == False))
+
+        entity_list = (
+
+            entity_query
 
                 .order_by(
                     dbLexicalEntry.created_at,
@@ -15661,7 +15693,7 @@ class Valency(graphene.Mutation):
 
         # Processing entities.
 
-        for entity in entity_list:
+        for entity, is_entry_deleted in entity_list:
 
             entry_id = (
                 (entity.parent_client_id, entity.parent_object_id))
@@ -15684,7 +15716,15 @@ class Valency(graphene.Mutation):
             elif not is_subject_for_parsing(entity.content):
                 continue
 
-            parser_result_list = (
+            if debug_flag:
+
+                log.debug(
+                    f'\nentity {entity.client_id}/{entity.object_id} {entry_id[0]}/{entry_id[1]}'
+                    f'\n{entity.content}')
+
+            # Also filtering out deleted parser results unless explicitly asked not to.
+
+            parser_result_query = (
 
                 DBSession
 
@@ -15692,8 +15732,120 @@ class Valency(graphene.Mutation):
 
                     .filter_by(
                         entity_client_id = entity.client_id,
-                        entity_object_id = entity.object_id,
-                        marked_for_deletion = False)
+                        entity_object_id = entity.object_id))
+
+            if not also_deleted_flag:
+
+                parser_result_query = (
+
+                    parser_result_query
+
+                        .filter_by(
+                            marked_for_deletion = False))
+
+            # If we need only updateable parser result valency data sources, we check hashes and updated_at
+            # of the existing sources, against the hashes of processed data and the valency data source
+            # processing version timestamp.
+
+            if only_updateable_flag:
+
+                # If we are also getting deleted sources, we skip deleted sources that do not already have
+                # processed data.
+
+                if also_deleted_flag:
+
+                    # We might already know the sources are considered deleted if their lexical entry or
+                    # their entity is deleted.
+
+                    if is_entry_deleted or entity.marked_for_deletion:
+
+                        parser_result_query = (
+
+                            parser_result_query
+
+                                .join(
+                                    dbValencyParserData,
+                                    and_(
+                                        dbValencyParserData.parser_result_client_id == dbParserResult.client_id,
+                                        dbValencyParserData.parser_result_object_id == dbParserResult.object_id))
+
+                                .join(
+                                    dbValencySourceData,
+                                    dbValencySourceData.id == dbValencyParserData.id)
+
+                                .filter(
+                                    or_(
+                                        dbValencyParserData.hash !=
+                                            func.encode(
+                                                func.digest(
+                                                    dbParserResult.content, 'sha256'),
+                                                'hex'),
+                                        dbValencySourceData.updated_at < Valency.version_timestamp)))
+
+                    # The entry and the entity are not deleted, we need to check parser results' deletion
+                    # status.
+
+                    else:
+
+                        parser_result_query = (
+
+                            parser_result_query
+
+                                .outerjoin(
+                                    dbValencyParserData,
+                                    and_(
+                                        dbValencyParserData.parser_result_client_id == dbParserResult.client_id,
+                                        dbValencyParserData.parser_result_object_id == dbParserResult.object_id))
+
+                                .outerjoin(
+                                    dbValencySourceData,
+                                    dbValencySourceData.id == dbValencyParserData.id)
+
+                                .filter(
+                                    case(
+                                        [(dbValencyParserData.id == None,
+                                            dbParserResult.marked_for_deletion == False)],
+                                        else_ = (
+                                            or_(
+                                                dbValencyParserData.hash !=
+                                                    func.encode(
+                                                        func.digest(
+                                                            dbParserResult.content, 'sha256'),
+                                                        'hex'),
+                                                dbValencySourceData.updated_at < Valency.version_timestamp)))))
+
+                # We are not getting deleted sources, just checking if the parser results are not processed
+                # or are updateable.
+
+                else:
+
+                    parser_result_query = (
+
+                        parser_result_query
+
+                            .outerjoin(
+                                dbValencyParserData,
+                                and_(
+                                    dbValencyParserData.parser_result_client_id == dbParserResult.client_id,
+                                    dbValencyParserData.parser_result_object_id == dbParserResult.object_id))
+
+                            .outerjoin(
+                                dbValencySourceData,
+                                dbValencySourceData.id == dbValencyParserData.id)
+
+                            .filter(
+                                or_(
+                                    dbValencyParserData.id == None,
+                                    dbValencyParserData.hash !=
+                                        func.encode(
+                                            func.digest(
+                                                dbParserResult.content, 'sha256'),
+                                            'hex'),
+                                    dbValencySourceData.updated_at < Valency.version_timestamp)))
+
+            parser_result_list = (
+
+                parser_result_query
 
                     .order_by(
                         dbParserResult.created_at,
@@ -15706,6 +15858,13 @@ class Valency(graphene.Mutation):
 
             for parser_result_index, parser_result in enumerate(parser_result_list):
 
+                if debug_flag:
+
+                    log.debug(
+                        '\nparser_result '
+                        f'{parser_result.client_id}/{parser_result.object_id} '
+                        f'{parser_result.entity_client_id}/{parser_result.entity_object_id}')
+
                 paragraph_list, token_count = (
 
                     export_parser_result.process_parser_result(
@@ -15713,11 +15872,22 @@ class Valency(graphene.Mutation):
                         debug_flag = debug_flag,
                         format_flag = True))
 
-                entry_info_dict['parser_result_list'].append({
+                parser_result_info_dict = {
+                    'entity_id': parser_result.entity_id,
                     'index': parser_result_index,
                     'id': parser_result.id,
                     'hash': hashlib.sha256(parser_result.content.encode('utf-8')).hexdigest(),
-                    'paragraphs': paragraph_list})
+                    'paragraphs': paragraph_list}
+
+                if also_deleted_flag:
+
+                    parser_result_info_dict['marked_for_deletion'] = (
+                        is_entry_deleted or
+                        entity.marked_for_deletion or
+                        parser_result.marked_for_deletion)
+
+                entry_info_dict['parser_result_list'].append(
+                    parser_result_info_dict)
 
         # Adding titles to parser results, if we have them.
 
@@ -15732,6 +15902,23 @@ class Valency(graphene.Mutation):
 
                 parser_result['title'] = title_str
                 parser_result_list.append(parser_result)
+
+        if debug_flag:
+
+            log.debug(
+                f'\nlen(parser_result_list): {len(parser_result_list)}')
+
+            if also_deleted_flag:
+
+                deleted_count = (
+
+                    sum(
+                        int(parser_result["marked_for_deletion"])
+                        for parser_result in parser_result_list))
+
+                log.debug(
+                    f'\n{deleted_count} deleted, '
+                    f'{len(parser_result_list) - deleted_count} not deleted')
 
         return parser_result_list
 
@@ -15763,7 +15950,8 @@ class Valency(graphene.Mutation):
         parser_result_list = (
 
             Valency.get_parser_result_data(
-                perspective_id, debug_flag))
+                perspective_id,
+                debug_flag = debug_flag))
 
         # If we have no parser results, we won't do anything.
 
@@ -16450,6 +16638,8 @@ class CreateValencyData(graphene.Mutation):
         perspective_id,
         data_case_set,
         instance_insert_list,
+        instance_id_clear_list,
+        instance_id_delete_list,
         debug_flag):
 
         # Getting parser result data.
@@ -16457,7 +16647,10 @@ class CreateValencyData(graphene.Mutation):
         parser_result_list = (
 
             Valency.get_parser_result_data(
-                perspective_id, debug_flag))
+                perspective_id,
+                only_updateable_flag = True,
+                also_deleted_flag = True,
+                debug_flag = debug_flag))
 
         sentence_data_list = (
             valency.corpus_to_sentences(parser_result_list))
@@ -16493,15 +16686,22 @@ class CreateValencyData(graphene.Mutation):
         for i in sentence_data_list:
 
             parser_result_id = i['id']
+            entity_id = i['entity_id']
+
+            log.debug(
+                '\nparser_result '
+                f'{parser_result_id[0]}/{parser_result_id[1]} '
+                f'{entity_id[0]}/{entity_id[1]}')
 
             # Checking if we already have such parser result valency data.
 
-            valency_parser_data = (
+            parser_source_data = (
 
                 DBSession
 
                     .query(
-                        dbValencyParserData)
+                        dbValencyParserData,
+                        dbValencySourceData)
 
                     .filter(
                         dbValencySourceData.perspective_client_id == perspective_id[0],
@@ -16512,16 +16712,286 @@ class CreateValencyData(graphene.Mutation):
 
                     .first())
 
-            if valency_parser_data:
+            # If we have, we are updating existing data, and we start by checking one-to-one correspondence
+            # between already existing sentences and sentences from processed parser result. It is expected
+            # to be true as the only part of the parser results that is editable is the grammatical markup.
 
-                # The same hash, we just skip it.
+            if parser_source_data:
 
-                if valency_parser_data.hash == i['hash']:
-                    continue
+                valency_parser_data, valency_source_data = (
+                    parser_source_data)
 
-                # Not the same hash, we actually should update it, but for now we leave it for later.
+                db_sentence_obj_list = (
 
+                    DBSession
+
+                        .query(
+                            dbValencySentenceData)
+
+                        .filter_by(
+                            source_id = valency_source_data.id)
+
+                        .order_by(
+                            dbValencySentenceData.id)
+
+                        .all())
+
+                pr_sentence_list = [
+
+                    s
+                    for p in i['paragraphs']
+                    for s in p['sentences']]
+
+                if len(db_sentence_obj_list) != len(pr_sentence_list):
+
+                    log.debug(
+                        f'\nlen(db_sentence_obj_list): {len(db_sentence_obj_list)}, '
+                        f'len(pr_sentence_list): {len(pr_sentence_list)}')
+
+                    raise NotImplementedError
+
+                # Assuming that stored and just parsed sentences should align by grammatical tokens.
+
+                for db_sentence_obj, pr_sentence in (
+                    zip(db_sentence_obj_list, pr_sentence_list)):
+
+                    db_token_list = db_sentence_obj.data['tokens']
+                    pr_token_list = pr_sentence
+
+                    if len(db_token_list) != len(pr_token_list):
+
+                        log.debug(
+                            f'\ndb_token_list:\n{pprint.pformat(db_token_list, width = 192)}'
+                            f'\npr_token_list:\n{pprint.pformat(pr_token_list, width = 192)}')
+
+                        raise NotImplementedError
+
+                    for index, (db_token, pr_token) in (
+                        enumerate(zip(db_token_list, pr_token_list))):
+
+                        if ((len(db_token) > 1 or len(pr_token) > 1) and
+                            db_token['token'] != pr_token['token']):
+
+                            log.debug(
+                                f'\ndb_token_list:\n{pprint.pformat(db_token_list, width = 192)}'
+                                f'\npr_token_list:\n{pprint.pformat(pr_token_list, width = 192)}'
+                                f'\ndb_token {index}:\n{pprint.pformat(db_token, width = 192)}'
+                                f'\npr_token {index}:\n{pprint.pformat(pr_token, width = 192)}')
+
+                            raise NotImplementedError
+
+                # Alright, now we're going to get instance data and look for differences we would have to
+                # update.
+
+                db_instance_obj_full_list = (
+
+                    DBSession
+
+                        .query(
+                            dbValencyInstanceData)
+
+                        .filter(
+                            dbValencyInstanceData.sentence_id == dbValencySentenceData.id,
+                            dbValencySentenceData.source_id == valency_source_data.id)
+
+                        .order_by(
+                            dbValencyInstanceData.sentence_id,
+                            dbValencyInstanceData.index)
+
+                        .all())
+
+                db_instance_obj_group_dict = {
+
+                    sentence_id: list(instance_group)
+
+                    for sentence_id, instance_group in (
+
+                        itertools.groupby(
+                            db_instance_obj_full_list,
+                            lambda db_instance_obj: db_instance_obj.sentence_id))}
+
+                if debug_flag:
+
+                    log.debug(
+                        '\ndb_instance_obj_group_dict:\n' +
+                        pprint.pformat(
+                            db_instance_obj_group_dict, width = 192))
+
+                # Processing sentence and instance data by sentences.
+
+                for db_sentence_obj, pr_sentence in (
+                    zip(db_sentence_obj_list, pr_sentence_list)):
+
+                    db_sentence_key = (
+
+                        tuple(
+                            tuple(sorted(t.items()))
+                            for t in db_sentence_obj.data['tokens']))
+
+                    pr_sentence_key = (
+
+                        tuple(
+                            tuple(sorted(t.items()))
+                            for t in pr_sentence))
+
+                    # No difference in sentence structure including grammar, meaning no difference in
+                    # instances either, we can go on to the next sentence.
+
+                    if db_sentence_key == pr_sentence_key:
+
+                        continue
+
+                    # We need to modify sentence data and compare instance sets.
+
+                    db_token_list = db_sentence_obj.data['tokens']
+                    pr_token_list = pr_sentence
+
+                    db_sentence_obj.data['tokens'] = pr_sentence
+                    flag_modified(db_sentence_obj, 'data')
+
+                    pr_instance_list = []
+
+                    for index, (lex, cs, indent, ind, r, animacy) in (
+                        enumerate(valency.sentence_instance_gen(pr_sentence))):
+
+                        pr_instance_list.append({
+                            'index': index,
+                            'location': (ind, r),
+                            'case': cs})
+
+                        data_case_set.add(cs)
+
+                    db_instance_obj_list = (
+                        db_instance_obj_group_dict.get(db_sentence_obj.id, []))
+
+                    if debug_flag:
+
+                        log.debug(
+                            '\ntokens:'
+                            f'\n{[t["token"] for t in pr_sentence]}'
+                            '\ndb_instances:'
+                            f'\n{pprint.pformat(db_sentence_obj.data.get("instances", []), width = 192)}'
+                            '\npr_instances:'
+                            f'\n{pprint.pformat(pr_instance_list, width = 192)}')
+
+                    # Starting by processing each instance we just got from processed parser result, trying
+                    # to re-use existing instance data.
+
+                    db_instance_obj_dict = {
+
+                        (tuple(db_instance['location']), db_instance_obj.case_str):
+                            db_instance_obj
+
+                        for db_instance_obj, db_instance in (
+                            zip(db_instance_obj_list, db_sentence_obj.data.get('instances', [])))}
+
+                    if len(db_instance_obj_dict) != len(db_instance_obj_list):
+
+                        raise NotImplementedError
+
+                    pr_instance_new_list = []
+
+                    for pr_instance in pr_instance_list:
+
+                        pr_instance_dict = {
+                            'sentence_id': db_sentence_obj.id,
+                            'index': pr_instance['index'],
+                            'verb_lex': pr_sentence[pr_instance['location'][0]]['lex'].lower(),
+                            'case_str': pr_instance['case'].lower()}
+
+                        pr_instance_key = (
+                            (pr_instance['location'], pr_instance_dict['case_str']))
+
+                        # We can re-use existing info for this instance.
+
+                        if pr_instance_key in db_instance_obj_dict:
+
+                            db_instance_obj = (
+                                db_instance_obj_dict.pop(pr_instance_key))
+
+                            index, verb_lex = (
+                                pr_instance_dict['index'],
+                                pr_instance_dict['verb_lex'])
+
+                            if db_instance_obj.index != index:
+                                db_instance_obj.index = index
+
+                            if db_instance_obj.verb_lex != verb_lex:
+                                db_instance_obj.verb_lex = verb_lex
+
+                        # We do not have existing info for this instance, we'll re-use unrelated info or
+                        # create a new one later.
+
+                        else:
+
+                            pr_instance_new_list.append(
+                                (pr_instance, pr_instance_dict))
+
+                    # Re-using any unrelated instance info, remembering to delete any annotations of these
+                    # instances later.
+
+                    db_instance_unused_list = (
+
+                        sorted(
+                            db_instance_obj_dict.values(),
+                            key = lambda db_instance_obj: db_instance_obj.id))
+
+                    instance_id_clear_list.extend((
+                        db_instance_obj.id
+                        for db_instance_obj in db_instance_unused_list))
+
+                    for (pr_instance, pr_instance_dict), db_instance_obj in (
+
+                        zip(
+                            pr_instance_new_list,
+                            db_instance_unused_list)):
+
+                        index, verb_lex, case_str = (
+                            pr_instance_dict['index'],
+                            pr_instance_dict['verb_lex'],
+                            pr_instance_dict['case_str'])
+
+                        if db_instance_obj.index != index:
+                            db_instance_obj.index = index
+
+                        if db_instance_obj.verb_lex != verb_lex:
+                            db_instance_obj.verb_lex = verb_lex
+
+                        if db_instance_obj.case_str != case_str:
+                            db_instance_obj.case_str = case_str
+
+                    # Going to delete any unused current instances.
+
+                    instance_id_delete_list.extend((
+                        db_instance_obj.id
+                        for db_instance_obj in db_instance_unused_list[ len(pr_instance_new_list) : ]))
+
+                    # Or, if we have new instances, we are going to create their info.
+
+                    instance_insert_list.extend(
+
+                        pr_instance_dict
+
+                        for pr_instance, pr_instance_dict in
+                            pr_instance_new_list[ len(db_instance_unused_list): ])
+
+                    # And finally updating sentence instance data.
+
+                    db_sentence_obj.data['instances'] = pr_instance_list
+                    flag_modified(db_sentence_obj, 'data')
+
+                # Updating hash and timestamp, if required, and going on.
+
+                if valency_parser_data.hash != i['hash']:
+                    valency_parser_data.hash = i['hash']
+
+                if valency_source_data.updated_at < Valency.version_timestamp:
+                    valency_source_data.updated_at = Valency.version_timestamp
+
+                DBSession.flush()
                 continue
+
+            # We are straightforwardly creating new data.
 
             valency_source_data = (
 
@@ -16581,11 +17051,13 @@ class CreateValencyData(graphene.Mutation):
                             'verb_lex': s[instance['location'][0]]['lex'].lower(),
                             'case_str': instance['case'].lower()})
 
-                    log.debug(
-                        '\n' +
-                        pprint.pformat(
-                            (valency_source_data.id, len(instance_list), sentence_data),
-                            width = 192))
+                    if debug_flag:
+
+                        log.debug(
+                            '\n' +
+                            pprint.pformat(
+                                (valency_source_data.id, len(instance_list), sentence_data),
+                                width = 192))
 
     @staticmethod
     def process_eaf(
@@ -17150,12 +17622,17 @@ class CreateValencyData(graphene.Mutation):
                 'allat']))
 
         data_case_set = set()
+
         instance_insert_list = []
+        instance_id_clear_list = []
+        instance_id_delete_list = []
 
         CreateValencyData.process_parser(
             perspective_id,
             data_case_set,
             instance_insert_list,
+            instance_id_clear_list,
+            instance_id_delete_list,
             debug_flag)
 
         CreateValencyData.process_eaf(
@@ -17164,6 +17641,35 @@ class CreateValencyData(graphene.Mutation):
             data_case_set,
             instance_insert_list,
             debug_flag)
+
+        # Deleting instances we should, clearing annotations if we have to, creating new instances if
+        # needed.
+
+        if instance_id_clear_list:
+
+            DBSession.execute(
+
+                dbValencyAnnotationData.__table__
+
+                    .delete()
+
+                    .where(
+                        dbValencyAnnotationData.instance_id.in_(
+                            utils.values_query(
+                                instance_id_clear_list, models.SLBigInteger))))
+
+        if instance_id_delete_list:
+
+            DBSession.execute(
+
+                dbValencyInstanceData.__table__
+
+                    .delete()
+
+                    .where(
+                        dbValencyInstanceData.id.in_(
+                            utils.values_query(
+                                instance_id_delete_list, models.SLBigInteger))))
 
         if instance_insert_list:
 
@@ -17177,6 +17683,10 @@ class CreateValencyData(graphene.Mutation):
             f'\ndata_case_set:\n{data_case_set}'
             f'\ndata_case_set - order_case_set:\n{data_case_set - order_case_set}'
             f'\norder_case_set - data_case_set:\n{order_case_set - data_case_set}')
+
+        # __DEBUG__
+
+        raise NotImplementedError
 
         return len(instance_insert_list)
 

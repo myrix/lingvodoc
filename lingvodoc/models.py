@@ -1903,6 +1903,8 @@ class ValencySourceData(
 
     __tablename__ = 'valency_source_data'
 
+    updated_at = Column(EpochType, default = datetime.datetime.utcnow, nullable = False)
+
 
 class ValencyParserData(
     Base,

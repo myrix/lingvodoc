@@ -65,6 +65,7 @@ from lingvodoc.utils.deletion import real_delete_perspective
 import sqlalchemy
 from sqlalchemy import (
     and_,
+    case,
     cast,
     column,
     extract,
@@ -78,6 +79,8 @@ from sqlalchemy import (
 from sqlalchemy.sql.expression import Grouping
 
 from lingvodoc.schema.gql_holders import UserAndOrganizationsRoles
+
+import lingvodoc.schema.query as query
 
 # Setting up logging.
 log = logging.getLogger(__name__)
@@ -566,111 +569,145 @@ class DictionaryPerspective(LingvodocObjectType):
 
         debug_flag = False
 
-        total_hash_union = (
+        version_timestamp = (
+            query.Valency.version_timestamp)
 
-            union(
+        #
+        # Parser result is considered unprocessed if:
+        #
+        # 1. It is not deleted (actually meaning that neither it, its entity or the entity's entry is
+        #  deleted), and:
+        #
+        #  1.1. It has no corresponding valency data source record, or...
+        #  1.2. It has corresponding source record, and either hashes don't match, or its processing
+        #   timestamp is before the latest processing algorithm version timestamp.
+        #
+        # 2. It is deleted, and there is a corresponding valency data source record, and either hashes don't
+        #  match, or it's processing timestamp is before the latest processing algorithm version timestamp.
+        #
+        # Or, restating in a more convenient form:
+        #
+        # 1. If it does not have corresponding source record:
+        #  1.1. If it is not deleted.
+        #
+        # 2. If it does have corresponding source record:
+        #  2.1. If hashes don't match, or timestamp is before the version timestamp.
+        #
+        # See also the same logic in query.Valency.get_parser_result_data() when only_updateable_flag is
+        # True.
+        #
 
-                DBSession
-
-                    .query(
-
-                        func.encode(
-                            func.digest(
-                                dbParserResult.content, 'sha256'),
-                            'hex')
-
-                            .label('hash'))
-
-                    .filter(
-                        dbLexicalEntry.parent_client_id == self.id[0],
-                        dbLexicalEntry.parent_object_id == self.id[1],
-                        dbLexicalEntry.marked_for_deletion == False,
-                        dbEntity.parent_client_id == dbLexicalEntry.client_id,
-                        dbEntity.parent_object_id == dbLexicalEntry.object_id,
-                        dbEntity.marked_for_deletion == False,
-                        dbPublishingEntity.client_id == dbEntity.client_id,
-                        dbPublishingEntity.object_id == dbEntity.object_id,
-                        dbPublishingEntity.published == True,
-                        dbPublishingEntity.accepted == True,
-                        dbParserResult.entity_client_id == dbEntity.client_id,
-                        dbParserResult.entity_object_id == dbEntity.object_id,
-                        dbParserResult.marked_for_deletion == False),
-
-                DBSession
-
-                    .query(
-
-                        cast(
-                            dbEntity.additional_metadata['hash'],
-                            sqlalchemy.UnicodeText)
-
-                            .label('hash'))
-
-                    .filter(
-                        dbLexicalEntry.parent_client_id == self.id[0],
-                        dbLexicalEntry.parent_object_id == self.id[1],
-                        dbLexicalEntry.marked_for_deletion == False,
-                        dbEntity.parent_client_id == dbLexicalEntry.client_id,
-                        dbEntity.parent_object_id == dbLexicalEntry.object_id,
-                        dbEntity.marked_for_deletion == False,
-                        dbEntity.content.ilike('%.eaf'),
-                        dbEntity.additional_metadata.contains({'data_type': 'elan markup'}),
-                        dbPublishingEntity.client_id == dbEntity.client_id,
-                        dbPublishingEntity.object_id == dbEntity.object_id,
-                        dbPublishingEntity.published == True,
-                        dbPublishingEntity.accepted == True))
-
-                .alias())
-
-        total_hash_subquery = (
+        parser_result_count = (
 
             DBSession
-                .query(total_hash_union)
+
+                .query(
+                    dbParserResult)
+
+                .filter(
+                    dbLexicalEntry.parent_client_id == self.id[0],
+                    dbLexicalEntry.parent_object_id == self.id[1],
+                    dbEntity.parent_client_id == dbLexicalEntry.client_id,
+                    dbEntity.parent_object_id == dbLexicalEntry.object_id,
+                    dbPublishingEntity.client_id == dbEntity.client_id,
+                    dbPublishingEntity.object_id == dbEntity.object_id,
+                    dbPublishingEntity.published == True,
+                    dbPublishingEntity.accepted == True,
+                    dbParserResult.entity_client_id == dbEntity.client_id,
+                    dbParserResult.entity_object_id == dbEntity.object_id)
+
+                .outerjoin(
+                    dbValencyParserData,
+                    and_(
+                        dbValencyParserData.parser_result_client_id == dbParserResult.client_id,
+                        dbValencyParserData.parser_result_object_id == dbParserResult.object_id))
+
+                .outerjoin(
+                    dbValencySourceData,
+                    dbValencySourceData.id == dbValencyParserData.id)
+
+                .filter(
+                    case(
+                        [(dbValencyParserData.id == None,
+                            and_(
+                                dbLexicalEntry.marked_for_deletion == False,
+                                dbEntity.marked_for_deletion == False,
+                                dbParserResult.marked_for_deletion == False))],
+                        else_ = (
+                            or_(
+                                dbValencyParserData.hash !=
+                                    func.encode(
+                                        func.digest(
+                                            dbParserResult.content, 'sha256'),
+                                        'hex'),
+                                dbValencySourceData.updated_at < version_timestamp))))
+
+                .count())
+
+        # 
+        # EAF markup files do not change, and so are considered unprocessed only of they are not deleted and
+        # do not already have corresponding valency data source record.
+        #
+
+        eaf_hash_subquery = (
+
+            DBSession
+
+                .query(
+
+                    cast(
+                        dbEntity.additional_metadata['hash'],
+                        sqlalchemy.UnicodeText)
+
+                        .label('hash'))
+
+                .filter(
+                    dbLexicalEntry.parent_client_id == self.id[0],
+                    dbLexicalEntry.parent_object_id == self.id[1],
+                    dbLexicalEntry.marked_for_deletion == False,
+                    dbEntity.parent_client_id == dbLexicalEntry.client_id,
+                    dbEntity.parent_object_id == dbLexicalEntry.object_id,
+                    dbEntity.marked_for_deletion == False,
+                    dbEntity.content.ilike('%.eaf'),
+                    dbEntity.additional_metadata.contains({'data_type': 'elan markup'}),
+                    dbPublishingEntity.client_id == dbEntity.client_id,
+                    dbPublishingEntity.object_id == dbEntity.object_id,
+                    dbPublishingEntity.published == True,
+                    dbPublishingEntity.accepted == True)
+
                 .subquery())
 
         if debug_flag:
 
-            total_hash_count = (
+            eaf_hash_count = (
 
                 DBSession
-                    .query(total_hash_union)
+                    .query(eaf_hash_subquery)
                     .count())
 
             log.debug(
-                f'total_hash_count: {total_hash_count}')
+                f'eaf_hash_count: {eaf_hash_count}')
 
-        has_hash_union = (
+        has_hash_subquery = (
 
-            union(
+            DBSession
 
-                DBSession
+                .query(
+                    dbValencyEafData.hash)
 
-                    .query(
-                        dbValencyParserData.hash)
+                .filter(
+                    dbValencySourceData.perspective_client_id == self.id[0],
+                    dbValencySourceData.perspective_object_id == self.id[1],
+                    dbValencyEafData.id == dbValencySourceData.id)
 
-                    .filter(
-                        dbValencySourceData.perspective_client_id == self.id[0],
-                        dbValencySourceData.perspective_object_id == self.id[1],
-                        dbValencyParserData.id == dbValencySourceData.id),
-
-                DBSession
-
-                    .query(
-                        dbValencyEafData.hash)
-
-                    .filter(
-                        dbValencySourceData.perspective_client_id == self.id[0],
-                        dbValencySourceData.perspective_object_id == self.id[1],
-                        dbValencyEafData.id == dbValencySourceData.id))
-
-                .alias())
+                .subquery())
 
         if debug_flag:
 
             has_hash_count = (
 
                 DBSession
-                    .query(has_hash_union)
+                    .query(has_hash_subquery)
                     .count())
 
             log.debug(
@@ -681,11 +718,11 @@ class DictionaryPerspective(LingvodocObjectType):
             DBSession
 
                 .query(
-                    total_hash_subquery.c.hash)
+                    eaf_hash_subquery.c.hash)
 
                 .filter(
-                    total_hash_subquery.c.hash.notin_(
-                        has_hash_union))
+                    eaf_hash_subquery.c.hash.notin_(
+                        has_hash_subquery))
 
                 .count())
 
@@ -694,7 +731,7 @@ class DictionaryPerspective(LingvodocObjectType):
             log.debug(
                 f'new_hash_count: {new_hash_count}')
 
-        return new_hash_count
+        return parser_result_count + new_hash_count
 
     @fetch_object()
     def resolve_lexical_entries(self, info, ids=None, mode=None, authors=None, clients=None, start_date=None, end_date=None,
