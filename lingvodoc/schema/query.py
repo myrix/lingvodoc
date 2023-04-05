@@ -4137,8 +4137,7 @@ class Query(graphene.ObjectType):
     perspectives = graphene.List(Perspective,
         published=graphene.Boolean(),
         only_with_phonology_data=graphene.Boolean(),
-        only_with_valency_data=graphene.Boolean(),
-        only_with_adverb_data=graphene.Boolean())
+        only_with_valency_data=graphene.Boolean())
     perspective = graphene.Field(Perspective, id=LingvodocID())
     entity = graphene.Field(Entity, id=LingvodocID())
     language = graphene.Field(Language, id=LingvodocID())
@@ -4331,6 +4330,7 @@ class Query(graphene.ObjectType):
             perspective_id = LingvodocID(required = True),
             offset = graphene.Int(),
             limit = graphene.Int(),
+            specificity_flag = graphene.Boolean(),
             adverb_prefix = graphene.String(),
             case_flag = graphene.Boolean(),
             accept_value = graphene.Boolean(),
@@ -5072,7 +5072,8 @@ class Query(graphene.ObjectType):
 
                         .query(
                             dbValencyInstanceData.verb_lex,
-                            dbValencyInstanceData.verb_lex.ilike(verb_prefix_filter_str)))
+                            dbValencyInstanceData.verb_lex.ilike(
+                                verb_prefix_filter_str)))
 
             else:
 
@@ -5776,8 +5777,7 @@ class Query(graphene.ObjectType):
         info,
         published = None,
         only_with_phonology_data = None,
-        only_with_valency_data = None,
-        only_with_adverb_data = None):
+        only_with_valency_data = None):
         """
         example:
 
@@ -8505,6 +8505,7 @@ class Query(graphene.ObjectType):
         perspective_id,
         offset = 0,
         limit = 25,
+        specificity_flag = True,
         adverb_prefix = None,
         case_flag = False,
         accept_value = None,
@@ -8516,6 +8517,7 @@ class Query(graphene.ObjectType):
             f'\nperspective_id: {perspective_id}'
             f'\noffset: {offset}'
             f'\nlimit: {limit}'
+            f'\nspecificity_flag: {specificity_flag}'
             f'\nadverb_prefix: {adverb_prefix}'
             f'\ncase_flag: {case_flag}'
             f'\naccept_value: {accept_value}'
@@ -8523,48 +8525,12 @@ class Query(graphene.ObjectType):
             f'\ndebug_flag: {debug_flag}')
 
         if sort_order_list is None:
-            sort_order_list = ['adverb', 'case', 'accept']
+            sort_order_list = ['specificity', 'adverb', 'case', 'accept']
+
+        specificity_flag = True
 
         adverb_flag = adverb_prefix is not None
         accept_flag = accept_value is not None
-
-        # If required, getting case ordering mapping as a temporary table.
-
-        """
-        if case_flag:
-
-            case_table_name = (
-
-                'case_table_' +
-                str(uuid.uuid4()).replace('-', '_'))
-
-            case_value_str = (
-
-                ', '.join(
-                    f'(\'{case_str}\', {index})'
-                    for index, case_str in (
-                        enumerate(adverb.cases))))
-
-            DBSession.execute(f'''
-                create temporary table
-                {case_table_name} (
-                  case_str TEXT PRIMARY KEY,
-                  order_value INT NOT NULL)
-                on commit drop;
-                insert into {case_table_name}
-                values {case_value_str};
-                ''')
-
-            class tmpCaseOrder(models.Base):
-
-                __tablename__ = case_table_name
-
-                case_str = (
-                    sqlalchemy.Column(sqlalchemy.types.UnicodeText, primary_key = True))
-
-                order_value = (
-                    sqlalchemy.Column(sqlalchemy.types.Integer, nullable = False))
-        """
 
         instance_query = (
 
@@ -8579,12 +8545,35 @@ class Query(graphene.ObjectType):
                     dbValencySentenceData.source_id == dbValencySourceData.id,
                     dbAdverbInstanceData.sentence_id == dbValencySentenceData.id))
 
+        # If we are going to sort by specificity, we will need a base instance CTE to generate specificity
+        # metrics.
+
+        instance_c = (
+            dbAdverbInstanceData)
+
+        if specificity_flag:
+
+            instance_cte = (
+                instance_query.cte())
+
+            instance_c = (
+                instance_cte.c)
+
+            instance_query = (
+                DBSession.query(instance_cte))
+
+        # Filtering by adverb prefix if required.
+
         if adverb_prefix:
+
+            adverb_prefix_filter_str = (
+                adverb_prefix.replace('%', '\\%') + '%')
 
             instance_query = (
 
                 instance_query.filter(
-                    dbAdverbInstanceData.adverb_lex.ilike(adverb_prefix.replace('%', '\\%') + '%')))
+                    instance_c.adverb_lex.ilike(
+                        adverb_prefix_filter_str)))
 
         instance_count = (
             instance_query.count())
@@ -8592,28 +8581,75 @@ class Query(graphene.ObjectType):
         # Getting ready to sort, if required.
 
         order_by_list = []
-        """
+
         for sort_type in sort_order_list:
 
-            if sort_type == 'adverb':
+            if sort_type == 'specificity':
+
+                if specificity_flag:
+
+                    count_cte = (
+
+                        DBSession
+
+                            .query(
+                                instance_c.adverb_lex,
+                                func.unnest(
+                                    func.string_to_array(
+                                        instance_c.case_str, ',')).label('mark_str'),
+                                func.count('*').label('c_i'))
+
+                            .group_by(
+                                instance_c.adverb_lex,
+                                'mark_str')
+
+                           .cte())
+
+                    specificity_subquery = (
+
+                        DBSession
+
+                            .query(
+                                count_cte.c.adverb_lex,
+                                func.count('*').label('c_unique'),
+
+                                (func.log(
+                                    2, func.sum(count_cte.c.c_i))
+
+                                    - func.sum(
+                                        count_cte.c.c_i * func.log(2, count_cte.c.c_i))
+                                        / func.sum(count_cte.c.c_i))
+
+                                    .label('H'))
+
+                            .group_by(
+                                count_cte.c.adverb_lex)
+
+                            .subquery())
+
+                    instance_query = (
+
+                        instance_query.outerjoin(
+                            specificity_subquery,
+                            instance_c.adverb_lex == specificity_subquery.c.adverb_lex))
+
+                    order_by_list.extend((
+                        specificity_subquery.c.c_unique,
+                        specificity_subquery.c.H))
+
+            elif sort_type == 'adverb':
 
                 if adverb_flag:
 
                     order_by_list.append(
-                        dbAdverbInstanceData.adverb_lex)
+                        instance_c.adverb_lex)
 
             elif sort_type == 'case':
 
                 if case_flag:
 
-                    instance_query = (
-
-                        instance_query.outerjoin(
-                            tmpCaseOrder,
-                            dbAdverbInstanceData.case_str == tmpCaseOrder.case_str))
-
                     order_by_list.append(
-                        tmpCaseOrder.order_value)
+                        func.string_to_array(instance_c.case_str, ','))
 
             elif sort_type == 'accept':
 
@@ -8638,13 +8674,13 @@ class Query(graphene.ObjectType):
 
                         instance_query.outerjoin(
                             accept_subquery,
-                            dbAdverbInstanceData.id == accept_subquery.c.instance_id))
+                            instance_c.id == accept_subquery.c.instance_id))
 
                     order_by_list.append(
                         func.coalesce(accept_subquery.c.accept_value, False) != accept_value)
-        """
+
         order_by_list.append(
-            dbAdverbInstanceData.id)
+            instance_c.id)
 
         # Getting annotation instances and related info.
 
@@ -8652,73 +8688,10 @@ class Query(graphene.ObjectType):
 
             instance_query
                 .order_by(*order_by_list)
-                #.offset(offset)
-                #.limit(limit)
-            )
+                .offset(offset)
+                .limit(limit))
 
-        from sqlalchemy import func
-
-        id_adverb_case = (
-            DBSession
-
-                .query(
-                dbAdverbInstanceData.id,
-                dbAdverbInstanceData.adverb_lex,
-                func.unnest(
-                  func.string_to_array(dbAdverbInstanceData.case_str, ',')).label('case_str'))
-
-                .filter(
-                dbValencySourceData.perspective_client_id == perspective_id[0],
-                dbValencySourceData.perspective_object_id == perspective_id[1])
-
-               .cte())
-
-        adverb_case_count_cte = (
-            DBSession
-
-                .query(
-                id_adverb_case.c.adverb_lex,
-                id_adverb_case.c.case_str,
-                func.count('*').label('c_i'))
-
-                .group_by(
-                id_adverb_case.c.adverb_lex,
-                id_adverb_case.c.case_str)
-
-                .cte())
-
-        adverb_lex_count_cte = (
-            DBSession
-                .query(
-                adverb_case_count_cte.c.adverb_lex,
-                func.count('*').label('c_uniq'),
-                func.sum(adverb_case_count_cte.c.c_i).label('total'))
-
-                .group_by(
-                adverb_case_count_cte.c.adverb_lex)
-
-                .order_by(c_uniq)
-
-                .cte())
-
-
-        entropy_query = (
-            DBSession
-                .query(
-                adverb_case_count_cte.c.adverb_lex,
-                (func.log(adverb_lex_count_cte.c.total, 2) -
-                 func.sum(adverb_case_count_cte.c.c_i * func.log(adverb_case_count_cte.c.с_i, 2)) /
-                 adverb_lex_count_cte.c.total).label('entropy'))
-
-                .qroup_by(
-                adverb_case_count_cte.c.adverb_lex,
-                adverb_case_count_cte.c.case_str,
-                adverb_lex_count_cte.c.adverb_lex)
-
-                .order_by(entropy)
-
-                .all())
-
+        instance_list = instance_query.all()
 
         if debug_flag:
 
@@ -8726,30 +8699,11 @@ class Query(graphene.ObjectType):
                 '\n' +
                 str(instance_query.statement.compile(compile_kwargs = {'literal_binds': True})))
 
-        try:
-            # Get instances list from CACHE (if is) and convert the string to list of dicts using json.loads
-            instance_list = json.loads(CACHE.get(adv_per_id(perspective_id)))
-        except:
-            instance_items = instance_query.all()
-            instance_list = [
-                {'id': instance.id,
-                 'sentence_id': instance.sentence_id,
-                 'index': instance.index,
-                 'adverb_lex': instance.adverb_lex,
-                 'case_str': instance.case_str}
-                for instance in instance_items]
-
-            # Sort instance_list by adverbs specificity (nulls and entropy)
-            CreateAdverbData.sort_instances(instance_list)
-            CACHE.set(adv_per_id(perspective_id), instance_list, ex = 86400)
-
-        instance_list = instance_list[offset: offset + limit]
-
         instance_id_set = (
-            set(instance['id'] for instance in instance_list))
+            set(instance.id for instance in instance_list))
 
         sentence_id_set = (
-            set(instance['sentence_id'] for instance in instance_list))
+            set(instance.sentence_id for instance in instance_list))
 
         log.debug(
             '\ninstance_id_set: {}'
@@ -8757,37 +8711,45 @@ class Query(graphene.ObjectType):
                 instance_id_set,
                 sentence_id_set))
 
-        sentence_list = (
+        sentence_list = []
 
-            DBSession
+        if sentence_id_set:
 
-                .query(
-                    dbValencySentenceData)
+            sentence_list = (
 
-                .filter(
-                    dbValencySentenceData.id.in_(sentence_id_set))
+                DBSession
 
-                .all())
+                    .query(
+                        dbValencySentenceData)
 
-        annotation_list = (
+                    .filter(
+                        dbValencySentenceData.id.in_(sentence_id_set))
 
-            DBSession
+                    .all())
 
-                .query(
-                    dbAdverbAnnotationData.instance_id,
+        annotation_list = []
 
-                    func.jsonb_agg(
-                        func.jsonb_build_array(
-                            dbAdverbAnnotationData.user_id,
-                            dbAdverbAnnotationData.accepted)))
+        if instance_id_set:
 
-                .filter(
-                    dbAdverbAnnotationData.instance_id.in_(instance_id_set))
+            annotation_list = (
 
-                .group_by(
-                    dbAdverbAnnotationData.instance_id)
+                DBSession
 
-                .all())
+                    .query(
+                        dbAdverbAnnotationData.instance_id,
+
+                        func.jsonb_agg(
+                            func.jsonb_build_array(
+                                dbAdverbAnnotationData.user_id,
+                                dbAdverbAnnotationData.accepted)))
+
+                    .filter(
+                        dbAdverbAnnotationData.instance_id.in_(instance_id_set))
+
+                    .group_by(
+                        dbAdverbAnnotationData.instance_id)
+
+                    .all())
 
         user_id_set = (
 
@@ -8810,6 +8772,16 @@ class Query(graphene.ObjectType):
                         dbUser.id.in_(user_id_set))
 
                     .all())
+
+        instance_list = [
+
+            {'id': instance.id,
+                'sentence_id': instance.sentence_id,
+                'index': instance.index,
+                'adverb_lex': instance.adverb_lex,
+                'case_str': instance.case_str}
+
+            for instance in instance_list]
 
         sentence_list = [
             dict(sentence.data, id = sentence.id)
@@ -8844,7 +8816,8 @@ class Query(graphene.ObjectType):
 
                         .query(
                             dbAdverbInstanceData.adverb_lex,
-                            dbAdverbInstanceData.adverb_lex.ilike(adverb_prefix.replace('%', '\\%') + '%')))
+                            dbAdverbInstanceData.adverb_lex.ilike(
+                                adverb_prefix_filter_str)))
 
             else:
 
@@ -8882,6 +8855,7 @@ class Query(graphene.ObjectType):
                     [[row[0], True] for row in adverb_list])
 
         return result_dict
+
 
 class PerspectivesAndFields(graphene.InputObjectType):
     perspective_id = LingvodocID()
@@ -16840,7 +16814,7 @@ class CreateValencyData(graphene.Mutation):
 
                     .first())
 
-            if valency_parser_data:
+            if valency_parser_data and valency_parser_data.hash != '':
 
                 # The same hash, we just skip it.
 
@@ -16851,25 +16825,30 @@ class CreateValencyData(graphene.Mutation):
 
                 continue
 
-            valency_source_data = (
+            # Creating parser data if we don't have one.
 
-                dbValencySourceData(
-                    perspective_client_id = perspective_id[0],
-                    perspective_object_id = perspective_id[1]))
+            if not valency_parser_data:
 
-            DBSession.add(valency_source_data)
-            DBSession.flush()
+                valency_source_data = (
 
-            valency_parser_data = (
+                    dbValencySourceData(
+                        perspective_client_id = perspective_id[0],
+                        perspective_object_id = perspective_id[1]))
 
-                dbValencyParserData(
-                    id = valency_source_data.id,
-                    parser_result_client_id = parser_result_id[0],
-                    parser_result_object_id = parser_result_id[1],
-                    hash = i['hash']))
+                DBSession.add(valency_source_data)
+                DBSession.flush()
 
-            DBSession.add(valency_parser_data)
-            DBSession.flush()
+                valency_parser_data = (
+
+                    dbValencyParserData(
+                        id = valency_source_data.id,
+                        parser_result_client_id = parser_result_id[0],
+                        parser_result_object_id = parser_result_id[1],
+                        hash = i['hash'],
+                        hash_adverb = ''))
+
+                DBSession.add(valency_parser_data)
+                DBSession.flush()
 
             for p in i['paragraphs']:
 
@@ -17737,7 +17716,7 @@ class SaveValencyData(graphene.Mutation):
                 return (
 
                     ResponseError(
-                        message = 'Only registered users can create valency data.'))
+                        message = 'Only registered users can save valency data.'))
 
             perspective_id = args['perspective_id']
             debug_flag = args.get('debug_flag', False)
@@ -18094,7 +18073,7 @@ class SetValencyAnnotation(graphene.Mutation):
 
             # NOTE:
             #
-            # Directly formatting arguments in in general can be unsafe, but here it's ok because we are
+            # Directly formatting arguments in general can be unsafe, but here it's ok because we are
             # relying on GraphQL's argument validation.
 
             value_list_str = (
@@ -18224,9 +18203,12 @@ class CreateAdverbData(graphene.Mutation):
         for i in sentence_data_list:
             parser_result_id = i['id']
 
-            # Checking if we already have such parser result valency data
+            # Checking if we already have such parser result valency data.
+
             valency_parser_data = (
+
                 DBSession
+
                     .query(
                         dbValencyParserData)
 
@@ -18239,52 +18221,39 @@ class CreateAdverbData(graphene.Mutation):
 
                     .first())
 
-            valency_sentence_dict = {}
-
             if valency_parser_data and valency_parser_data.hash_adverb != '':
+
                 # The same hash, we just skip it.
+
                 if valency_parser_data.hash_adverb == i['hash']:
                     continue
-                # Not the same hash, we actually should update it, but for now we leave it for later
+
+                # Not the same hash, we actually should update it, but for now we leave it for later.
+
                 continue
 
-                # Update hash
-                valency_parser_data.hash_adverb = i['hash']
-                flag_modified(valency_parser_data, 'hash_adverb')
+            # Creating parser data if we don't have one.
 
-                # We have parser result data
-                # So we can get stored sentences for valency_parser_data.id
-                valency_sentence_list = (
-                    DBSession
-                        .query(
-                        dbValencySentenceData)
+            if not valency_parser_data:
 
-                        .filter(
-                        dbValencySentenceData.source_id == valency_parser_data.id)
-
-                        .all())
-
-                # get canonical form of valency_sentence_list for matching
-                for entry in valency_sentence_list:
-                    key = tuple(tuple(sorted(t.items())) for t in entry.data['tokens'])
-                    valency_sentence_dict[key] = entry
-            else:
-
-                # We do not have parser result source data, we create everything from scratch
                 valency_source_data = (
+
                     dbValencySourceData(
-                        perspective_client_id=perspective_id[0],
-                        perspective_object_id=perspective_id[1]))
+                        perspective_client_id = perspective_id[0],
+                        perspective_object_id = perspective_id[1]))
+
                 DBSession.add(valency_source_data)
                 DBSession.flush()
 
                 valency_parser_data = (
+
                     dbValencyParserData(
-                        id=valency_source_data.id,
-                        parser_result_client_id=parser_result_id[0],
-                        parser_result_object_id=parser_result_id[1],
-                        hash_adverb=i['hash'],
-                        hash=''))
+                        id = valency_source_data.id,
+                        parser_result_client_id = parser_result_id[0],
+                        parser_result_object_id = parser_result_id[1],
+                        hash = '',
+                        hash_adverb = i['hash']))
+
                 DBSession.add(valency_parser_data)
                 DBSession.flush()
 
@@ -18325,7 +18294,6 @@ class CreateAdverbData(graphene.Mutation):
                         DBSession.add(valency_sentence_data)
                         DBSession.flush()
 
-
                     for instance in sentence_data['instances_adv']:
                         instance_insert_list.append({
                             'sentence_id': valency_sentence_data.id,
@@ -18337,8 +18305,8 @@ class CreateAdverbData(graphene.Mutation):
                     log.debug(
                         '\n' +
                         pprint.pformat(
-                            (valency_parser_data.id, len(sentence_data['instances']), sentence_data),
-                            width=192))
+                            (valency_parser_data.id, len(instance_list), sentence_data),
+                            width = 192))
 
     @staticmethod
     def process(
@@ -18356,34 +18324,7 @@ class CreateAdverbData(graphene.Mutation):
             debug_flag)
 
         if instance_insert_list:
-            CACHE.rem(adv_per_id(perspective_id))
-            '''
-            for instance_insert in instance_insert_list:
 
-                instance_stored = (
-                    DBSession
-                        .query(
-                        dbAdverbInstanceData)
-
-                        .filter(
-                        dbValencySourceData.perspective_client_id == perspective_id[0],
-                        dbValencySourceData.perspective_object_id == perspective_id[1],
-                        dbAdverbInstanceData.sentence_id == instance_insert['sentence_id'],
-                        dbAdverbInstanceData.index == instance_insert['index'])
-
-                        .first())
-
-                if instance_stored:
-                    instance_stored.adverb_lex = instance_insert['adverb_lex']
-                    flag_modified(instance_stored, 'adverb_lex')
-                    instance_stored.case_str = instance_insert['case_str']
-                    flag_modified(instance_stored, 'case_str')
-                else:
-                    DBSession.execute(
-                        dbAdverbInstanceData.__table__
-                            .insert()
-                            .values(instance_insert))
-            '''
             DBSession.execute(
                 dbAdverbInstanceData.__table__
                     .insert()
@@ -18550,6 +18491,330 @@ class CreateAdverbData(graphene.Mutation):
             return ResponseError('Exception:\n' + traceback_string)
 
 
+class SaveAdverbData(graphene.Mutation):
+
+    class Arguments:
+
+        perspective_id = LingvodocID(required = True)
+        debug_flag = graphene.Boolean()
+
+    triumph = graphene.Boolean()
+    data_url = graphene.String()
+
+    @staticmethod
+    def mutate(root, info, **args):
+
+        try:
+
+            client_id = info.context.get('client_id')
+            client = DBSession.query(Client).filter_by(id = client_id).first()
+
+            if not client:
+
+                return (
+
+                    ResponseError(
+                        message = 'Only registered users can save adverb data.'))
+
+            perspective_id = args['perspective_id']
+            debug_flag = args.get('debug_flag', False)
+
+            perspective = (
+                DBSession.query(dbPerspective).filter_by(
+                    client_id = perspective_id[0], object_id = perspective_id[1]).first())
+
+            if not perspective:
+
+                return (
+
+                    ResponseError(
+                        message = 'No perspective {}/{} in the system.'.format(*perspective_id)))
+
+            dictionary = perspective.parent
+
+            locale_id = info.context.get('locale_id') or 2
+
+            dictionary_name = dictionary.get_translation(locale_id)
+            perspective_name = perspective.get_translation(locale_id)
+
+            full_name = dictionary_name + ' \u203a ' + perspective_name
+
+            if dictionary.marked_for_deletion:
+
+                return (
+
+                    ResponseError(message =
+                        'Dictionary \'{}\' {}/{} of perspective \'{}\' {}/{} is deleted.'.format(
+                            dictionary_name,
+                            dictionary.client_id,
+                            dictionary.object_id,
+                            perspective_name,
+                            perspective.client_id,
+                            perspective.object_id)))
+
+            if perspective.marked_for_deletion:
+
+                return (
+
+                    ResponseError(message =
+                        'Perspective \'{}\' {}/{} is deleted.'.format(
+                            full_name,
+                            perspective.client_id,
+                            perspective.object_id)))
+
+            # Getting adverb annotation data.
+
+            annotation_list = (
+
+                DBSession
+
+                    .query(
+                        dbAdverbAnnotationData)
+
+                    .filter(
+                        dbAdverbAnnotationData.accepted != None,
+                        dbAdverbAnnotationData.instance_id == dbAdverbInstanceData.id,
+                        dbAdverbInstanceData.sentence_id == dbValencySentenceData.id,
+                        dbValencySentenceData.source_id == dbValencySourceData.id,
+                        dbValencySourceData.perspective_client_id == perspective_id[0],
+                        dbValencySourceData.perspective_object_id == perspective_id[1])
+
+                    .all())
+
+            instance_id_set = set()
+            user_id_set = set()
+
+            for annotation in annotation_list:
+
+                instance_id_set.add(annotation.instance_id)
+                user_id_set.add(annotation.user_id)
+
+            instance_list = []
+
+            if instance_id_set:
+
+                instance_list = (
+
+                    DBSession
+
+                        .query(
+                            dbAdverbInstanceData)
+
+                        .filter(
+                            dbAdverbInstanceData.id.in_(
+
+                                utils.values_query(
+                                    instance_id_set, models.SLBigInteger)))
+
+                        .all())
+
+            user_list = []
+
+            if user_id_set:
+
+                user_list = (
+
+                    DBSession
+
+                        .query(
+                            dbUser.id, dbUser.name)
+
+                        .filter(
+                            dbUser.id.in_(
+
+                                utils.values_query(
+                                    user_id_set, models.SLBigInteger)))
+
+                        .all())
+
+            sentence_id_set = (
+                set(instance.sentence_id for instance in instance_list))
+
+            sentence_list = []
+
+            if sentence_id_set:
+
+                sentence_list = (
+
+                    DBSession
+
+                        .query(
+                            dbValencySentenceData)
+
+                        .filter(
+                            dbValencySentenceData.id.in_(
+
+                                utils.values_query(
+                                    sentence_id_set, models.SLBigInteger)))
+
+                        .all())
+
+            # Preparing adverb annotation data.
+
+            sentence_data_list = []
+
+            for sentence in sentence_list:
+
+                sentence_data = sentence.data
+                sentence_data['id'] = sentence.id
+
+                sentence_data_list.append(sentence_data)
+
+            instance_data_list = [
+
+                {'id': instance.id,
+                    'sentence_id': instance.sentence_id,
+                    'index': instance.index,
+                    'adverb_lex': instance.verb_lex,
+                    'case_str': instance.case_str}
+
+                    for instance in instance_list]
+
+            annotation_data_list = [
+
+                {'instance_id': annotation.instance_id,
+                    'user_id': annotation.user_id,
+                    'accepted': annotation.accepted}
+
+                    for annotation in annotation_list]
+
+            user_data_list = [
+
+                {'id': user.id,
+                    'name': user.name}
+
+                    for user in user_list]
+
+            data_dict = {
+                'sentence_list': sentence_data_list,
+                'instance_list': instance_data_list,
+                'annotation_list': annotation_data_list,
+                'user_list': user_data_list}
+
+            # Saving adverb annotation data as zipped JSON.
+
+            current_time = (
+                time.time())
+
+            current_date = (
+                datetime.datetime.utcfromtimestamp(current_time))
+
+            zip_date = (
+                current_date.year,
+                current_date.month,
+                current_date.day,
+                current_date.hour,
+                current_date.minute,
+                current_date.second)
+
+            storage_temporary = (
+                info.context.request.registry.settings['storage']['temporary'])
+
+            host = storage_temporary['host']
+            bucket = storage_temporary['bucket']
+
+            minio_client = (
+                    
+                minio.Minio(
+                    host,
+                    access_key = storage_temporary['access_key'],
+                    secret_key = storage_temporary['secret_key'],
+                    secure = True))
+
+            temporary_file = (
+                    
+                tempfile.NamedTemporaryFile(
+                    delete = False))
+
+            zip_file = (
+
+                zipfile.ZipFile(
+                    temporary_file,
+                    'w',
+                    compression = zipfile.ZIP_DEFLATED,
+                    compresslevel = 9))
+
+            zip_info = (
+
+                zipfile.ZipInfo(
+                    'data.json', zip_date))
+
+            zip_info.compress_type = zipfile.ZIP_DEFLATED
+
+            with zip_file.open(
+                zip_info, 'w') as binary_data_file:
+
+                with io.TextIOWrapper(
+                    binary_data_file, 'utf-8') as text_data_file:
+
+                    json.dump(
+                        data_dict,
+                        text_data_file,
+                        ensure_ascii = False,
+                        sort_keys = True,
+                        indent = 2)
+
+            zip_file.close()
+            temporary_file.close()
+
+            if debug_flag:
+
+                shutil.copy(
+                    temporary_file.name,
+                    '__data__.json.zip')
+
+            object_name = (
+
+                storage_temporary['prefix'] +
+            
+                '/'.join((
+                    'adverb_data',
+                    '{:.6f}'.format(current_time),
+                    'data.json.zip')))
+
+            (etag, version_id) = (
+
+                minio_client.fput_object(
+                    bucket,
+                    object_name,
+                    temporary_file.name))
+
+            os.remove(
+                temporary_file.name)
+
+            url = (
+
+                '/'.join((
+                    'https:/',
+                    host,
+                    bucket,
+                    object_name)))
+
+            return (
+
+                SaveAdverbData(
+                    triumph = True,
+                    data_url = url))
+
+        except Exception as exception:
+
+            traceback_string = (
+
+                ''.join(
+                    traceback.format_exception(
+                        exception, exception, exception.__traceback__))[:-1])
+
+            log.warning('save_adverb_data: exception')
+            log.warning(traceback_string)
+
+            transaction.abort()
+
+            return (
+
+                ResponseError(
+                    'Exception:\n' + traceback_string))
+
+
 class SetAdverbAnnotation(graphene.Mutation):
 
     class AdverbInstanceAnnotation(graphene.types.Scalar):
@@ -18606,7 +18871,7 @@ class SetAdverbAnnotation(graphene.Mutation):
 
             # NOTE:
             #
-            # Directly formatting arguments in in general can be unsafe, but here it's ok because we are
+            # Directly formatting arguments in general can be unsafe, but here it's ok because we are
             # relying on GraphQL's argument validation.
 
             value_list_str = (
@@ -18756,6 +19021,7 @@ class MyMutations(graphene.ObjectType):
     save_valency_data = SaveValencyData.Field()
     set_valency_annotation = SetValencyAnnotation.Field()
     create_adverb_data = CreateAdverbData.Field()
+    save_adverb_data = SaveAdverbData.Field()
     set_adverb_annotation = SetAdverbAnnotation.Field()
 
 schema = graphene.Schema(query=Query, auto_camelcase=False, mutation=MyMutations)
