@@ -5,96 +5,149 @@ Revises: 98a07e65f1bb
 Create Date: 2023-04-20 15:57:54.428738
 
 """
-import distutils
-import logging
-import secrets
-import traceback
-from json import dumps
-
-import transaction
-from keycloak import KeycloakAdmin, KeycloakOpenID, KeycloakOpenIDConnection, KeycloakUMA, KeycloakOperationError, \
-    KeycloakGetError, KeycloakPostError, KeycloakPutError
-from sqlalchemy import and_, pool, engine_from_config, select
-
-from alembic import op
-from sqlalchemy.orm import Session
-
-from lingvodoc.models import (
-
-    User,
-    BaseGroup, Group, user_to_group_association)
-
-LOCALES_DICT = {"ru": 1, "en": 2}
-
-from lingvodoc.keycloakld import KeycloakSession
-import lingvodoc.cache.caching as caching
 
 # revision identifiers, used by Alembic.
 revision = '477131175d56'
 down_revision = '98a07e65f1bb'
 branch_labels = None
 depends_on = None
-from alembic import context
 
-config = context.config
 
-LOG = logging.getLogger('keycloak')
+# Standard library imports.
 
-Session = Session(bind=op.get_bind())
+from json import dumps
+import logging
+
+
+# External imports.
+
+from alembic import context, op
+
+import distutils
+
+from keycloak import (
+    KeycloakAdmin,
+    KeycloakGetError,
+    KeycloakOpenID,
+    KeycloakOpenIDConnection,
+    KeycloakOperationError,
+    KeycloakPostError,
+    KeycloakPutError,
+    KeycloakUMA)
+
+import secrets
+
+from sqlalchemy import (
+    and_,
+    engine_from_config,
+    pool,
+    select)
+
+from sqlalchemy.orm import Session
+
+import transaction
+
+
+# Lingvodoc imports.
+
+from lingvodoc.models import (
+    User,
+    BaseGroup,
+    Group,
+    user_to_group_association)
+
+from lingvodoc.keycloakld import KeycloakSession
+
+import lingvodoc.cache.caching as caching
+
 from lingvodoc.cache.caching import (
-    initialize_cache
-)
+    initialize_cache)
+
+
+log = logging.getLogger('keycloak')
+
+LOCALES_DICT = {"ru": 1, "en": 2}
+
 
 def upgrade():
-    LOG.debug('CONNECT TO THE KEYCLOAK')
+
+    config = context.config
+    DBSession = Session(bind=op.get_bind())
 
     cache_kwargs = config.get_section('cache:redis:args')
-    cache_kwargs.pop("here")
-    LOG.info(dumps(cache_kwargs))
-    if cache_kwargs:
-        initialize_cache(cache_kwargs)
-    else:
-        raise Exception("Could not migrate users without redis. Check configuration")
+    cache_kwargs.pop('here')
 
-    keycloak_dict = config.get_section("keycloak")
-    if keycloak_dict:
-        KeycloakSession.client_name = keycloak_dict["client_name"]
-        KeycloakSession.keycloak_admin = KeycloakAdmin(server_url=keycloak_dict["server_url"],
-                                                       username=keycloak_dict["admin"],
-                                                       password=keycloak_dict["password"],
-                                                       realm_name=keycloak_dict["realm_name_admin"],
-                                                       auto_refresh_token=["get", "post", "put", "delete"])
-        KeycloakSession.keycloak_admin.realm_name = keycloak_dict["realm_name"]
-        KeycloakSession.openid_client = KeycloakOpenID(server_url=keycloak_dict["server_url"],
-                                                       client_id=keycloak_dict["client_name"],
-                                                       realm_name=keycloak_dict["realm_name"],
-                                                       client_secret_key=keycloak_dict["client_secret_key"])
-        keycloak_connection = KeycloakOpenIDConnection(
-            custom_headers={"Content-Type": "application/x-www-form-urlencoded"},
-            server_url=keycloak_dict["server_url"],
-            realm_name=keycloak_dict["realm_name"],
-            client_id=keycloak_dict["client_name"],
-            client_secret_key=keycloak_dict["client_secret_key"])
-        LOG.debug('set keycloak_connection')
-        uma = KeycloakUMA(connection=keycloak_connection)
-        KeycloakSession.keycloak_uma = uma
-        KeycloakSession.keycloak_url = keycloak_dict["client_secret_key"]
+    log.info(dumps(cache_kwargs))
 
-        migrate_users(keycloak_dict["user_password"])
-        transaction.manager.commit()
+    if not cache_kwargs:
+
+        raise Exception('Could not migrate users without redis. Check configuration.')
+
+    initialize_cache(cache_kwargs)
+
+    keycloak_dict = config.get_section('keycloak')
+
+    if not keycloak_dict:
+
+        raise Exception('Could not migrate users without keycloak connection. Check configuration.')
+
+    KeycloakSession.client_name = keycloak_dict['client_name']
+
+    KeycloakSession.keycloak_admin = (
+
+        KeycloakAdmin(
+            server_url=keycloak_dict['server_url'],
+            username=keycloak_dict['admin'],
+            password=keycloak_dict['password'],
+            realm_name=keycloak_dict['realm_name_admin'],
+            auto_refresh_token=['get', 'post', 'put', 'delete']))
+
+    KeycloakSession.keycloak_admin.realm_name = keycloak_dict['realm_name']
+
+    KeycloakSession.openid_client = (
+
+        KeycloakOpenID(
+            server_url=keycloak_dict['server_url'],
+            client_id=keycloak_dict['client_name'],
+            realm_name=keycloak_dict['realm_name'],
+            client_secret_key=keycloak_dict['client_secret_key']))
+
+    keycloak_connection = (
+
+        KeycloakOpenIDConnection(
+            custom_headers={'Content-Type': 'application/x-www-form-urlencoded'},
+            server_url=keycloak_dict['server_url'],
+            realm_name=keycloak_dict['realm_name'],
+            client_id=keycloak_dict['client_name'],
+            client_secret_key=keycloak_dict['client_secret_key']))
+
+    log.debug('set keycloak_connection')
+
+    uma = KeycloakUMA(connection=keycloak_connection)
+
+    KeycloakSession.keycloak_uma = uma
+    KeycloakSession.keycloak_url = keycloak_dict['client_secret_key']
+
+    migrate_users(keycloak_dict['user_password'])
+
+    transaction.manager.commit()
 
 
 def downgrade():
-    LOG.debug('unroll keycloak')
-    pass
+
+    log.debug('unroll keycloak')
 
 
 def add_permissions(client_id):
-    LOG.debug('ADD PERMISSIONS TO THE KEYCLOAK')
+
+    log.debug('ADD PERMISSIONS TO THE KEYCLOAK')
+
     subjects = ["dictionary", "language", "translation_string", "edit_user", "perspective_role", "dictionary_role",
                 "organization", "perspective", "lexical_entries_and_entities", "approve_entities", "merge",
                 "translations", "grant", "dictionary_status", "perspective_status"]
+
     actions = ["approve", "create", "delete", "edit", "view"]
+
     policies = KeycloakSession.keycloak_admin.get_client_authz_policies(client_id=client_id)
     scopes = KeycloakSession.keycloak_admin.get_client_authz_scopes(client_id=client_id)
     scope_id = policy_id = ""
@@ -140,17 +193,20 @@ def add_permissions(client_id):
                 }, skip_exists=True)
         except KeycloakPostError as e:
             logging.debug(e.error_message)
-    LOG.debug('PERMISSIONS ADDED TO THE KEYCLOAK')
+    log.debug('PERMISSIONS ADDED TO THE KEYCLOAK')
+
 
 def migrate_users(password="secret"):
-    REDIS_CACHE = caching.CACHE
-    if REDIS_CACHE is None:
-        REDIS_CACHE = caching.CACHE
+
+    raise NotImplementedError
+
+    redis_cache = caching.CACHE
+
     client_id = KeycloakSession.keycloak_admin.get_client_id(client_id=KeycloakSession.client_name)
     add_permissions(client_id)
-    LOG.debug('START MIGRATION TO THE KEYCLOAK')
-    users = Session.query(User).all()
-    REDIS_CACHE.set_pure("keys", [])
+    log.debug('START MIGRATION TO THE KEYCLOAK')
+    users = DBSession.query(User).all()
+    redis_cache.set_pure("keys", [])
     for user in users:
         with open("users_test_alembic.txt", 'a+') as f:
             user_name = user_login = secrets.token_hex(8)
@@ -160,10 +216,10 @@ def migrate_users(password="secret"):
                 if keycloak_user_id is not None:
                     KeycloakSession.keycloak_admin.set_user_password(user_id=keycloak_user_id, password=password,
                                                                      temporary=False)
-                    if Session.query(User).filter_by(id=keycloak_user_id).first() is None:
-                        Session.query(User).filter_by(id=user.id).update(values={"id": keycloak_user_id},
+                    if DBSession.query(User).filter_by(id=keycloak_user_id).first() is None:
+                        DBSession.query(User).filter_by(id=user.id).update(values={"id": keycloak_user_id},
                                                                            synchronize_session='fetch')
-                        Session.flush()
+                        DBSession.flush()
                     else:
                         f.write(
                             "User already migrated or duplicated: {} user email {} , Keycloak ID: {}\n".format(
@@ -209,11 +265,11 @@ def migrate_users(password="secret"):
                                                                                "type": "password"}],
                                                                           })
 
-                    Session.query(User).filter_by(id=user.id).update(values={"id": keycloak_user_id},
+                    DBSession.query(User).filter_by(id=user.id).update(values={"id": keycloak_user_id},
                                                                        synchronize_session='fetch')
-                    Session.flush()
+                    DBSession.flush()
 
-                    create_user_associated_resources(REDIS_CACHE, keycloak_user_id)
+                    create_user_associated_resources(redis_cache, keycloak_user_id)
 
 
 
@@ -223,12 +279,12 @@ def migrate_users(password="secret"):
                     f.write(
                         "User with error: {} user email {} error: {}\n".format(user.__dict__, user_email,
                                                                                str(e)))
-    keys = REDIS_CACHE.get_pure("keys")
+    keys = redis_cache.get_pure("keys")
     if keys is not None:
         for key in keys:
             attributes = {}
             try:
-                resource = REDIS_CACHE.get_pure(key)
+                resource = redis_cache.get_pure(key)
                 attributes = resource.get("attributes", None)
                 if attributes is not None:
                     for key, value in attributes.items():
@@ -240,9 +296,9 @@ def migrate_users(password="secret"):
                 logging.debug(
                     "Keycloak could not update resource with key: " + key + "with error: " + str(
                         e.error_message)+"\n")
-        REDIS_CACHE.rem(keys)
+        redis_cache.rem(keys)
 
-def create_user_associated_resources(REDIS_CACHE, keycloak_user_id=None, ):
+def create_user_associated_resources(redis_cache, keycloak_user_id=None, ):
     if keycloak_user_id is None:
         raise KeycloakOperationError(error_message="User id could not be null")
     subjects = ["dictionary", "language", "translation_string", "edit_user", "perspective_role", "dictionary_role",
@@ -251,7 +307,7 @@ def create_user_associated_resources(REDIS_CACHE, keycloak_user_id=None, ):
     actions = ["approve", "create", "delete", "edit", "view"]
     for subject in subjects:
         for action in actions:
-            objects = Session.query(BaseGroup, Group, user_to_group_association, Group.subject_client_id,
+            objects = DBSession.query(BaseGroup, Group, user_to_group_association, Group.subject_client_id,
                                       Group.subject_object_id).filter(and_(
                 BaseGroup.subject == subject,
                 BaseGroup.action == action,
@@ -274,10 +330,10 @@ def create_user_associated_resources(REDIS_CACHE, keycloak_user_id=None, ):
                                 obj.Group.subject_object_id),
                             "attributes": {scope: [keycloak_user_id]}
                         }
-                        if REDIS_CACHE.get_pure(name) is None:
-                            REDIS_CACHE.set_pure(name, resource_to_create)
+                        if redis_cache.get_pure(name) is None:
+                            redis_cache.set_pure(name, resource_to_create)
                         else:
-                            resource = REDIS_CACHE.get_pure(name)
+                            resource = redis_cache.get_pure(name)
                             resource["scopes"].append(scope)
                             resource["scopes"] = list(set(resource["scopes"]))
                             temp = resource["attributes"].get(scope, None)
@@ -286,11 +342,11 @@ def create_user_associated_resources(REDIS_CACHE, keycloak_user_id=None, ):
                             else:
                                 temp.append(keycloak_user_id)
                             resource["attributes"][scope] = list(set(temp))
-                            REDIS_CACHE.set_pure(name, resource)
+                            redis_cache.set_pure(name, resource)
 
-                        keys = REDIS_CACHE.get_pure("keys")
+                        keys = redis_cache.get_pure("keys")
 
                         if keys is not None:
                             keys.append(name)
                             keys = list(set(keys))
-                            REDIS_CACHE.set_pure("keys", keys)
+                            redis_cache.set_pure("keys", keys)
