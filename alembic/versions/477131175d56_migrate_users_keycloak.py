@@ -17,6 +17,7 @@ depends_on = None
 
 from json import dumps
 import logging
+import pprint
 
 
 # External imports.
@@ -68,11 +69,12 @@ log = logging.getLogger('keycloak')
 
 LOCALES_DICT = {"ru": 1, "en": 2}
 
+DBSession = Session(bind = op.get_bind())
+
 
 def upgrade():
 
     config = context.config
-    DBSession = Session(bind=op.get_bind())
 
     cache_kwargs = config.get_section('cache:redis:args')
     cache_kwargs.pop('here')
@@ -93,6 +95,22 @@ def upgrade():
 
     KeycloakSession.client_name = keycloak_dict['client_name']
 
+    # __DEBUG__
+
+#   log.debug('\n' + pprint.pformat(keycloak_dict, 144))
+
+#   keycloak_connection = (
+
+#       KeycloakOpenIDConnection(
+#           server_url=keycloak_dict['server_url'],
+#           username=keycloak_dict['admin'],
+#           password=keycloak_dict['password'],
+#           realm_name=keycloak_dict['realm_name_admin']))
+
+#   raise NotImplementedError
+
+    # __
+
     KeycloakSession.keycloak_admin = (
 
         KeycloakAdmin(
@@ -101,6 +119,12 @@ def upgrade():
             password=keycloak_dict['password'],
             realm_name=keycloak_dict['realm_name_admin'],
             auto_refresh_token=['get', 'post', 'put', 'delete']))
+
+    # __DEBUG__
+
+#   raise NotImplementedError
+
+    # __
 
     KeycloakSession.keycloak_admin.realm_name = keycloak_dict['realm_name']
 
@@ -128,6 +152,10 @@ def upgrade():
     KeycloakSession.keycloak_uma = uma
     KeycloakSession.keycloak_url = keycloak_dict['client_secret_key']
 
+    # __DEBUG__
+
+#   raise NotImplementedError
+
     migrate_users(keycloak_dict['user_password'])
 
     transaction.manager.commit()
@@ -150,6 +178,16 @@ def add_permissions(client_id):
 
     policies = KeycloakSession.keycloak_admin.get_client_authz_policies(client_id=client_id)
     scopes = KeycloakSession.keycloak_admin.get_client_authz_scopes(client_id=client_id)
+
+    # __DEBUG__
+
+    log.debug(policies)
+    log.debug(scopes)
+
+    raise NotImplementedError
+
+    # __
+
     scope_id = policy_id = ""
     scopes_id_list = [scope["id"] for scope in scopes]
     for subject in subjects:
@@ -193,20 +231,38 @@ def add_permissions(client_id):
                 }, skip_exists=True)
         except KeycloakPostError as e:
             logging.debug(e.error_message)
+            raise
     log.debug('PERMISSIONS ADDED TO THE KEYCLOAK')
 
 
 def migrate_users(password="secret"):
 
-    raise NotImplementedError
+    # __DEBUG__
+
+#   raise NotImplementedError
+
+    # __
 
     redis_cache = caching.CACHE
 
     client_id = KeycloakSession.keycloak_admin.get_client_id(client_id=KeycloakSession.client_name)
     add_permissions(client_id)
+
     log.debug('START MIGRATION TO THE KEYCLOAK')
-    users = DBSession.query(User).all()
+
     redis_cache.set_pure("keys", [])
+
+    # __DEBUG__
+
+    #users = DBSession.query(User).all()
+    users = DBSession.query(User).filter(or_(User.id_v1 == 1, User.id_v1 == 5)).all()
+
+    log.debug(users)
+
+    raise NotImplementedError
+
+    # __
+
     for user in users:
         with open("users_test_alembic.txt", 'a+') as f:
             user_name = user_login = secrets.token_hex(8)
@@ -314,39 +370,43 @@ def create_user_associated_resources(redis_cache, keycloak_user_id=None, ):
                 Group.base_group_id == BaseGroup.id,
                 user_to_group_association.c.user_id == str(keycloak_user_id),
                 user_to_group_association.c.group_id == Group.id)).all()
-            if len(objects):
-                scope = "urn:" + str(KeycloakSession.client_name) + ":scopes:" + str(action)
-                type = "urn:" + str(KeycloakSession.client_name) + ":resources:" + str(subject)
-                for obj in objects:
-                    if obj.Group.subject_client_id and obj.Group.subject_object_id:
-                        name = str(subject) + "/" + str(obj.Group.subject_client_id) + "/" + str(
-                            obj.Group.subject_object_id)
 
-                        resource_to_create = {
-                            "name": name,
-                            "scopes": [scope],
-                            "type": type,
-                            "uri": str(obj.Group.subject_client_id) + "/" + str(
-                                obj.Group.subject_object_id),
-                            "attributes": {scope: [keycloak_user_id]}
-                        }
-                        if redis_cache.get_pure(name) is None:
-                            redis_cache.set_pure(name, resource_to_create)
+            if not len(objects):
+                continue
+
+            scope = "urn:" + str(KeycloakSession.client_name) + ":scopes:" + str(action)
+            type = "urn:" + str(KeycloakSession.client_name) + ":resources:" + str(subject)
+
+            for obj in objects:
+                if obj.Group.subject_client_id and obj.Group.subject_object_id:
+                    name = str(subject) + "/" + str(obj.Group.subject_client_id) + "/" + str(
+                        obj.Group.subject_object_id)
+
+                    resource_to_create = {
+                        "name": name,
+                        "scopes": [scope],
+                        "type": type,
+                        "uri": str(obj.Group.subject_client_id) + "/" + str(
+                            obj.Group.subject_object_id),
+                        "attributes": {scope: [keycloak_user_id]}
+                    }
+                    if redis_cache.get_pure(name) is None:
+                        redis_cache.set_pure(name, resource_to_create)
+                    else:
+                        resource = redis_cache.get_pure(name)
+                        resource["scopes"].append(scope)
+                        resource["scopes"] = list(set(resource["scopes"]))
+                        temp = resource["attributes"].get(scope, None)
+                        if temp is None:
+                            temp = [keycloak_user_id]
                         else:
-                            resource = redis_cache.get_pure(name)
-                            resource["scopes"].append(scope)
-                            resource["scopes"] = list(set(resource["scopes"]))
-                            temp = resource["attributes"].get(scope, None)
-                            if temp is None:
-                                temp = [keycloak_user_id]
-                            else:
-                                temp.append(keycloak_user_id)
-                            resource["attributes"][scope] = list(set(temp))
-                            redis_cache.set_pure(name, resource)
+                            temp.append(keycloak_user_id)
+                        resource["attributes"][scope] = list(set(temp))
+                        redis_cache.set_pure(name, resource)
 
-                        keys = redis_cache.get_pure("keys")
+                    keys = redis_cache.get_pure("keys")
 
-                        if keys is not None:
-                            keys.append(name)
-                            keys = list(set(keys))
-                            redis_cache.set_pure("keys", keys)
+                    if keys is not None:
+                        keys.append(name)
+                        keys = list(set(keys))
+                        redis_cache.set_pure("keys", keys)

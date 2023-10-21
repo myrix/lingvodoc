@@ -1425,7 +1425,7 @@ class PublishingEntity(Base, TableNameMixin, CreatedAtMixin):
 
 
 user_to_group_association = Table('user_to_group_association', Base.metadata,
-                                  Column('user_id', VARCHAR(length=36), ForeignKey('user.id', onupdate="cascade")),
+                                  Column('user_id', UUIDType, ForeignKey('user.id', onupdate="cascade")),
                                   Column('group_id', UUIDType, ForeignKey('group.id'))
                                   )
 
@@ -1435,14 +1435,14 @@ organization_to_group_association = Table('organization_to_group_association', B
                                           )
 
 user_to_organization_association = Table('user_to_organization_association', Base.metadata,
-                                         Column('user_id', VARCHAR(length=36), ForeignKey('user.id')),
+                                         Column('user_id', UUIDType, ForeignKey('user.id')),
                                          Column('organization_id', SLBigInteger(), ForeignKey('organization.id'))
                                          )
 
 
 class User(Base, TableNameMixin, CreatedAtMixin, AdditionalMetadataMixin):
-    id = Column(VARCHAR(length=36), primary_key=True, nullable=False)
-    v1_id = Column(SLBigInteger)
+    id = Column(UUIDType, primary_key=True, nullable=False)
+    id_v1 = Column(SLBigInteger)
     login = Column(UnicodeText, unique=True, nullable=True)
     name = Column(UnicodeText)
     # this stands for name in English
@@ -1537,7 +1537,7 @@ class Organization(
 
 
 class Passhash(Base, TableNameMixin, IdMixin, CreatedAtMixin):
-    user_id = Column(VARCHAR(length=36), ForeignKey('user.id', onupdate="cascade"), nullable=False)
+    user_id = Column(UUIDType, ForeignKey('user.id', onupdate="cascade"), nullable=False)
     hash = Column(UnicodeText, nullable=False)
 
     def __init__(self, password):
@@ -1551,7 +1551,7 @@ class Email(Base, TableNameMixin, IdMixin, CreatedAtMixin):
 
 
 class Client(Base, TableNameMixin, IdMixin, CreatedAtMixin, AdditionalMetadataMixin):
-    user_id = Column(VARCHAR(length=36), ForeignKey('user.id', onupdate="cascade"), nullable=False)
+    user_id = Column(UUIDType, ForeignKey('user.id', onupdate="cascade"), nullable=False)
     # creation_time = Column(DateTime, default=datetime.datetime.utcnow, nullable=False)
     is_browser_client = Column(Boolean, default=True, nullable=False)
     user = relationship("User", cascade="save-update", backref='clients')
@@ -1582,7 +1582,7 @@ class UserBlobs(CompositeIdMixin, Base, TableNameMixin, CreatedAtMixin, MarkedFo
     real_storage_path = Column(UnicodeText, nullable=False)
     data_type = Column(UnicodeText, nullable=False)
     # created_at = Column(DateTime, default=datetime.datetime.utcnow)
-    user_id = Column(VARCHAR(length=36), ForeignKey('user.id', onupdate="cascade"))
+    user_id = Column(UUIDType, ForeignKey('user.id', onupdate="cascade"))
     user = relationship("User", cascade="save-update", backref='userblobs')
 
 
@@ -1625,7 +1625,7 @@ class Grant(IdMixin, Base, TableNameMixin, CreatedAtMixin, TranslationMixin, Add
 
 class UserRequest(IdMixin, Base, TableNameMixin, CreatedAtMixin, AdditionalMetadataMixin):
     sender_id = Column(SLBigInteger(), nullable=False)
-    recipient_id = Column(VARCHAR(length=36), nullable=False)
+    recipient_id = Column(UUIDType, nullable=False)
     broadcast_uuid = Column(String(36), nullable=False)
     type = Column(String(1000), nullable=False)
     subject = Column(JSONB)
@@ -1970,7 +1970,7 @@ class ValencyAnnotationData(
     __tablename__ = 'valency_annotation_data'
 
     instance_id = Column(SLBigInteger(), ForeignKey('valency_instance_data.id'), primary_key = True)
-    user_id = Column(VARCHAR(length=36), ForeignKey('user.id', onupdate="cascade"), primary_key = True)
+    user_id = Column(UUIDType, ForeignKey('user.id', onupdate="cascade"), primary_key = True)
     accepted = Column(Boolean, default = None)
 
 
